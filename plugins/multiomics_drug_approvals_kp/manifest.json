@@ -1,0 +1,20 @@
+{
+    "version": "0.1",
+    "__metadata__": {
+        "license_url": "",
+        "license": "CC BY 4.0",
+        "url": ""
+    },
+    "dumper": {
+        "data_url": [
+            "https://storage.googleapis.com/multiomics_provider_kp_data/drug_approvals/drug_approvals_kg_edges_v0.1.tsv",
+            "https://storage.googleapis.com/multiomics_provider_kp_data/drug_approvals/drug_approvals_kg_nodes_v0.1.tsv"
+        ],
+        "uncompress": false,
+        "release": "version:get_release"
+    },
+    "uploader": {
+        "parser": "file_parser:load_data",
+        "on_duplicates": "ignore"
+    }
+}
