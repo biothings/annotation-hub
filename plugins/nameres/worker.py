@@ -16,19 +16,22 @@ from biothings.utils.hub_db import get_src_db
 
 from .static import NAMERES_UPLOAD_CHUNKS
 
-
 logger = config.logger
 
 
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1 * os.cpu_count()) as executor:
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=1 * os.cpu_count()
+    ) as executor:
         process_futures = []
         for index, task in enumerate(_build_offset_tasks(data_folder, collection_name)):
             future = executor.submit(subset_upload_worker, **task)
             process_futures.append(future)
 
         total_document_count = 0
-        for index, future in enumerate(concurrent.futures.as_completed(process_futures)):
+        for index, future in enumerate(
+            concurrent.futures.as_completed(process_futures)
+        ):
             try:
                 buffer_upload = future.result()
             except Exception as gen_exc:
@@ -53,8 +56,14 @@ def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
     that is continually uploading to the backend database
     """
 
-    def _populate_upload_arguments(input_file: Union[Path, str], num_partitions: int) -> list:
-        logger.info("Analyzing offsets for %s | number of partitions %s", input_file, num_partitions)
+    def _populate_upload_arguments(
+        input_file: Union[Path, str], num_partitions: int
+    ) -> list:
+        logger.info(
+            "Analyzing offsets for %s | number of partitions %s",
+            input_file,
+            num_partitions,
+        )
         offsets = generate_file_offsets(input_file, num_partitions)
 
         if offsets is not None:
@@ -84,9 +93,13 @@ def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
             future = executor.submit(_populate_upload_arguments, **arguments)
             thread_futures.append(future)
 
-    concurrent.futures.wait(thread_futures, timeout=None, return_when=concurrent.futures.ALL_COMPLETED)
+    concurrent.futures.wait(
+        thread_futures, timeout=None, return_when=concurrent.futures.ALL_COMPLETED
+    )
 
-    yield from itertools.chain.from_iterable([future.result() for future in thread_futures])
+    yield from itertools.chain.from_iterable(
+        [future.result() for future in thread_futures]
+    )
 
 
 def generate_file_offsets(file: Union[str, Path], num_partitions: int = None):
@@ -193,10 +206,17 @@ def subset_upload_worker(
     Afterwards the data processing is straight forward, we effectively don't transform the state of
     the nameres files
     """
-    logger.info("Starting bulk upload to backend %s [%s|%s]", input_file, offset_start, offset_end)
+    logger.info(
+        "Starting bulk upload to backend %s [%s|%s]",
+        input_file,
+        offset_start,
+        offset_end,
+    )
 
     upload_database = get_src_db()
-    collection = pymongo.collection.Collection(database=upload_database, name=collection_name)
+    collection = pymongo.collection.Collection(
+        database=upload_database, name=collection_name
+    )
 
     total_upload = 0
     with open(input_file, encoding="utf-8") as file_handle:
@@ -223,19 +243,26 @@ def subset_upload_worker(
 
             if len(buffer) >= buffer_size:
                 total_upload += len(buffer)
-                _upload_buffer(collection, buffer, input_file, file_handle.tell() / offset_end)
+                _upload_buffer(
+                    collection, buffer, input_file, file_handle.tell() / offset_end
+                )
                 buffer = []
 
         if len(buffer) > 0:
             total_upload += len(buffer)
-            _upload_buffer(collection, buffer, input_file, file_handle.tell() / offset_end)
+            _upload_buffer(
+                collection, buffer, input_file, file_handle.tell() / offset_end
+            )
             buffer = []
 
     return total_upload
 
 
 def _upload_buffer(
-    collection: pymongo.collection.Collection, buffer: list[dict], input_file: Union[str, Path], progress: float
+    collection: pymongo.collection.Collection,
+    buffer: list[dict],
+    input_file: Union[str, Path],
+    progress: float,
 ):
     try:
         t0 = time.perf_counter()
@@ -253,7 +280,9 @@ def _upload_buffer(
 
 
 def _handle_bulk_write_error(
-    bulk_write_error: BulkWriteError, collection: pymongo.collection.Collection, input_file: Union[str, Path]
+    bulk_write_error: BulkWriteError,
+    collection: pymongo.collection.Collection,
+    input_file: Union[str, Path],
 ):
     logger.debug("Fixing %d records ", len(bulk_write_error.details["writeErrors"]))
     ids = [d["op"]["_id"] for d in bulk_write_error.details["writeErrors"]]

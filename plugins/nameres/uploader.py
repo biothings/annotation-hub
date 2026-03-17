@@ -8,7 +8,6 @@ from biothings.utils.manager import JobManager
 from .static import BASE_URL
 from .worker import upload_process
 
-
 logger = config.logger
 
 
@@ -34,7 +33,9 @@ class NameResUploader(BaseSourceUploader):
         def uploaded(f):
             nonlocal got_error
             if not isinstance(f.result(), int):
-                got_error = Exception(f"upload error (should have a int as returned value got {repr(f.result())}")
+                got_error = Exception(
+                    f"upload error (should have a int as returned value got {repr(f.result())}"
+                )
 
         job.add_done_callback(uploaded)
         await job

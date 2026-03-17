@@ -27,21 +27,24 @@ from .static import (
     NODENORM_UPLOAD_CHUNKS,
 )
 
-
 logger = config.logger
 
 
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     create_identifiers_table(data_folder)
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1 * os.cpu_count()) as executor:
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=1 * os.cpu_count()
+    ) as executor:
         process_futures = []
         for index, task in enumerate(_build_offset_tasks(data_folder, collection_name)):
             future = executor.submit(subset_upload_worker, **task)
             process_futures.append(future)
 
         total_document_count = 0
-        for index, future in enumerate(concurrent.futures.as_completed(process_futures)):
+        for index, future in enumerate(
+            concurrent.futures.as_completed(process_futures)
+        ):
             try:
                 identifiers = future.result()
             except Exception as gen_exc:
@@ -73,10 +76,19 @@ def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
     that is continually uploading to the backend database
     """
 
-    def _populate_upload_arguments(input_file: Union[Path, str], num_partitions: int) -> list:
-        logger.info("Analyzing offsets for %s | number of partitions %s", input_file, num_partitions)
+    def _populate_upload_arguments(
+        input_file: Union[Path, str], num_partitions: int
+    ) -> list:
+        logger.info(
+            "Analyzing offsets for %s | number of partitions %s",
+            input_file,
+            num_partitions,
+        )
         conflation_database = None
-        if input_file.name in DRUG_CHEMICAL_IDENTIFIER_FILES or input_file.name in GENE_PROTEIN_IDENTIFER_FILES:
+        if (
+            input_file.name in DRUG_CHEMICAL_IDENTIFIER_FILES
+            or input_file.name in GENE_PROTEIN_IDENTIFER_FILES
+        ):
             data_folder = Path(input_file).absolute().resolve().parent
             conflation_database = data_folder.joinpath(CONFLATION_LOOKUP_DATABASE)
 
@@ -107,9 +119,13 @@ def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
             future = executor.submit(_populate_upload_arguments, **arguments)
             thread_futures.append(future)
 
-    concurrent.futures.wait(thread_futures, timeout=None, return_when=concurrent.futures.ALL_COMPLETED)
+    concurrent.futures.wait(
+        thread_futures, timeout=None, return_when=concurrent.futures.ALL_COMPLETED
+    )
 
-    yield from itertools.chain.from_iterable([future.result() for future in thread_futures])
+    yield from itertools.chain.from_iterable(
+        [future.result() for future in thread_futures]
+    )
 
 
 def generate_file_offsets(file: Union[str, Path], num_partitions: int = None):
@@ -140,7 +156,8 @@ def generate_file_offsets(file: Union[str, Path], num_partitions: int = None):
             return previous_index["index"]
 
         logger.debug(
-            "Different hash found for file %s [%s, %s] [previous, current]. " "Updating file offsets with the new file",
+            "Different hash found for file %s [%s, %s] [previous, current]. "
+            "Updating file offsets with the new file",
             file,
             previous_index["hash"],
             file_hash,
@@ -215,13 +232,20 @@ def subset_upload_worker(
     Afterwards the data processing is straight forward, we effectively don't transform the state of
     the nodenorm files
     """
-    logger.info("Starting bulk upload to backend %s [%s|%s]", input_file, offset_start, offset_end)
+    logger.info(
+        "Starting bulk upload to backend %s [%s|%s]",
+        input_file,
+        offset_start,
+        offset_end,
+    )
     conflation_connection = None
     if conflation_database is not None:
         conflation_connection = sqlite3.connect(str(conflation_database))
 
     upload_database = get_src_db()
-    collection = pymongo.collection.Collection(database=upload_database, name=collection_name)
+    collection = pymongo.collection.Collection(
+        database=upload_database, name=collection_name
+    )
 
     with open(input_file, encoding="utf-8") as file_handle:
         buffer = []
@@ -248,20 +272,30 @@ def subset_upload_worker(
 
             if len(buffer) >= buffer_size:
                 if conflation_connection is not None:
-                    buffer = _update_buffer_with_conflations(buffer, canonical_identifiers, conflation_connection)
-                _upload_buffer(collection, buffer, input_file, file_handle.tell() / offset_end)
+                    buffer = _update_buffer_with_conflations(
+                        buffer, canonical_identifiers, conflation_connection
+                    )
+                _upload_buffer(
+                    collection, buffer, input_file, file_handle.tell() / offset_end
+                )
                 buffer = []
                 canonical_identifiers = []
 
         if len(buffer) > 0:
             if conflation_connection is not None:
-                buffer = _update_buffer_with_conflations(buffer, canonical_identifiers, conflation_connection)
-            _upload_buffer(collection, buffer, input_file, file_handle.tell() / offset_end)
+                buffer = _update_buffer_with_conflations(
+                    buffer, canonical_identifiers, conflation_connection
+                )
+            _upload_buffer(
+                collection, buffer, input_file, file_handle.tell() / offset_end
+            )
     return identifiers
 
 
 def _update_buffer_with_conflations(
-    buffer: list[dict], canonical_identifiers: list[str], conflation_database: sqlite3.Connection
+    buffer: list[dict],
+    canonical_identifiers: list[str],
+    conflation_database: sqlite3.Connection,
 ) -> list[str]:
     """
     Batch updates the buffer documents with the conflation identifiers found
@@ -275,9 +309,13 @@ def _update_buffer_with_conflations(
     """
     identifiers_repr = ", ".join("?" for _ in canonical_identifiers)
     search_statement = f"SELECT identifiers, type FROM conflations WHERE conflation in ({identifiers_repr})"
-    identifier_results = conflation_database.execute(search_statement, canonical_identifiers)
+    identifier_results = conflation_database.execute(
+        search_statement, canonical_identifiers
+    )
 
-    lookup_buffer_index = {document["identifiers"][0]["i"]: index for index, document in enumerate(buffer)}
+    lookup_buffer_index = {
+        document["identifiers"][0]["i"]: index for index, document in enumerate(buffer)
+    }
 
     for conflation_result in identifier_results.fetchall():
         if conflation_result is not None:
@@ -296,7 +334,10 @@ def _update_buffer_with_conflations(
 
 
 def _upload_buffer(
-    collection: pymongo.collection.Collection, buffer: list[dict], input_file: Union[str, Path], progress: float
+    collection: pymongo.collection.Collection,
+    buffer: list[dict],
+    input_file: Union[str, Path],
+    progress: float,
 ):
     try:
         t0 = time.perf_counter()
@@ -314,7 +355,9 @@ def _upload_buffer(
 
 
 def _handle_bulk_write_error(
-    bulk_write_error: BulkWriteError, collection: pymongo.collection.Collection, input_file: Union[str, Path]
+    bulk_write_error: BulkWriteError,
+    collection: pymongo.collection.Collection,
+    input_file: Union[str, Path],
 ):
     logger.debug("Fixing %d records ", len(bulk_write_error.details["writeErrors"]))
     ids = [d["op"]["_id"] for d in bulk_write_error.details["writeErrors"]]
@@ -347,15 +390,15 @@ def _handle_bulk_write_error(
 
 def create_identifiers_table(data_folder: Union[str, Path]) -> None:
     logger.debug("Creating sqlite3 identifiers database")
-    identifier_database = Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
+    identifier_database = (
+        Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
+    )
     identifier_connection = sqlite3.connect(str(identifier_database))
     cursor = identifier_connection.cursor()
     identifier_existence_check = "DROP TABLE IF EXISTS identifiers"
     cursor.execute(identifier_existence_check)
 
-    identifier_table = (
-        "CREATE TABLE IF NOT EXISTS identifiers(identifier text PRIMARY KEY NOT NULL, count INT DEFAULT 1);"
-    )
+    identifier_table = "CREATE TABLE IF NOT EXISTS identifiers(identifier text PRIMARY KEY NOT NULL, count INT DEFAULT 1);"
     cursor.execute(identifier_table)
     identifier_connection.commit()
     identifier_connection.close()
@@ -363,11 +406,15 @@ def create_identifiers_table(data_folder: Union[str, Path]) -> None:
 
 def create_identifiers_index(data_folder: Union[str, Path]) -> None:
     logger.debug("Creating sqlite3 identifiers database index")
-    identifier_database = Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
+    identifier_database = (
+        Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
+    )
     identifier_connection = sqlite3.connect(str(identifier_database))
     cursor = identifier_connection.cursor()
 
-    identifier_index = "CREATE INDEX IF NOT EXISTS idx_identifiers ON identifiers (identifier, count);"
+    identifier_index = (
+        "CREATE INDEX IF NOT EXISTS idx_identifiers ON identifiers (identifier, count);"
+    )
     cursor.execute(identifier_index)
     identifier_connection.commit()
     identifier_connection.close()
@@ -376,7 +423,9 @@ def create_identifiers_index(data_folder: Union[str, Path]) -> None:
 def create_mongo_identifiers_index(collection_name: str) -> None:
     logger.debug("Creating mongodb identifiers.i database index")
     upload_database = get_src_db()
-    collection = pymongo.collection.Collection(database=upload_database, name=collection_name)
+    collection = pymongo.collection.Collection(
+        database=upload_database, name=collection_name
+    )
     collection.create_index("identifiers.i")
 
 
@@ -409,7 +458,9 @@ def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: st
     """
     logger.info("Handling CURIE duplication issue")
 
-    identifier_database = Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
+    identifier_database = (
+        Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
+    )
     identifier_connection = sqlite3.connect(str(identifier_database))
     cursor = identifier_connection.cursor()
 
@@ -418,10 +469,16 @@ def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: st
     duplicate_curies = tuple(results.fetchall())
     identifier_connection.close()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1 * os.cpu_count()) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1 * os.cpu_count()
+    ) as executor:
         process_futures = []
         for index, curie_batch in enumerate(iter_n(duplicate_curies, 1000)):
-            arguments = {"task_id": index, "curies": curie_batch, "collection_name": collection_name}
+            arguments = {
+                "task_id": index,
+                "curies": curie_batch,
+                "collection_name": collection_name,
+            }
             future = executor.submit(_curie_duplication_batch_handler, **arguments)
             process_futures.append(future)
 
@@ -441,7 +498,9 @@ def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: st
                 )
 
 
-def _curie_duplication_batch_handler(task_id: int, curies: list[str], collection_name: str):
+def _curie_duplication_batch_handler(
+    task_id: int, curies: list[str], collection_name: str
+):
 
     num_retry = 10
     counter = 0
@@ -453,7 +512,9 @@ def _curie_duplication_batch_handler(task_id: int, curies: list[str], collection
     upload_database = get_src_db()
     while collection is None:
         try:
-            collection = pymongo.collection.Collection(database=upload_database, name=collection_name)
+            collection = pymongo.collection.Collection(
+                database=upload_database, name=collection_name
+            )
         except pymongo.errors.ServerSelectionTimeoutError as mongo_timeout_error:
             counter += 1
             logger.exception(mongo_timeout_error)
@@ -482,21 +543,32 @@ def _curie_duplication_batch_handler(task_id: int, curies: list[str], collection
             # produces every combination, but we need to store it on a per identifier level so we
             # can determine if any of the identifiers match any of the others. This is the goal
             # behind the comparison matrix we build to make every inner comparison possible
-            identifier_combinations = tuple(itertools.combinations(documents[0]["identifiers"], 2))
+            identifier_combinations = tuple(
+                itertools.combinations(documents[0]["identifiers"], 2)
+            )
 
             comparison_matrix = defaultdict(list)
             for index, identifier in enumerate(documents[0]["identifiers"]):
-                comparison_filter = [identifier in entry for entry in identifier_combinations]
-                comparison_matrix[index] = tuple(itertools.compress(identifier_combinations, comparison_filter))
+                comparison_filter = [
+                    identifier in entry for entry in identifier_combinations
+                ]
+                comparison_matrix[index] = tuple(
+                    itertools.compress(identifier_combinations, comparison_filter)
+                )
 
             removal_index = []
             for index, comparisons in comparison_matrix.items():
                 removal_index.append(
-                    not all(identifier_group[0] == identifier_group[1] for identifier_group in comparisons)
+                    not all(
+                        identifier_group[0] == identifier_group[1]
+                        for identifier_group in comparisons
+                    )
                 )
 
             # Skipping document as we likely already merged this earlier with duplicate _id merging
-            if all(removal_index) or (not any(removal_index) and len(removal_index) == 1):
+            if all(removal_index) or (
+                not any(removal_index) and len(removal_index) == 1
+            ):
                 logger.debug(
                     "[Task %d] Ignore 1 document due to initial upload BulkWriteError caught duplicate _id. Likely identical documents merged on the type field: %s",
                     task_id,
@@ -514,16 +586,22 @@ def _curie_duplication_batch_handler(task_id: int, curies: list[str], collection
                 )
             else:
                 original_document = copy.deepcopy(documents[0])
-                documents[0]["identifiers"] = list(itertools.compress(documents[0]["identifiers"], removal_index))
+                documents[0]["identifiers"] = list(
+                    itertools.compress(documents[0]["identifiers"], removal_index)
+                )
                 buffer.append(pymongo.ReplaceOne(original_document, documents[0]))
                 logger.debug(
-                    "[Task %d] Replace 1 document to trim some duplicate identifiers: %s", task_id, documents[0]
+                    "[Task %d] Replace 1 document to trim some duplicate identifiers: %s",
+                    task_id,
+                    documents[0],
                 )
 
         # Handle case where the identifier.i is spread across 2 documents
         elif len(documents) == 2:
 
-            def _evaluate_document_subset(more_identifiers_doc: dict, less_identifiers_doc: dict) -> pymongo.DeleteOne:
+            def _evaluate_document_subset(
+                more_identifiers_doc: dict, less_identifiers_doc: dict
+            ) -> pymongo.DeleteOne:
                 """
                 If it passes the subset check, then we can safely delete the document while keeping
                 the other document. It must be a complete subset, otherwise we have to perform
@@ -532,15 +610,21 @@ def _curie_duplication_batch_handler(task_id: int, curies: list[str], collection
                 """
                 subset_check = []
                 for subset_identifier in less_identifiers_doc["identifiers"]:
-                    subset_check.append(subset_identifier in more_identifiers_doc["identifiers"])
+                    subset_check.append(
+                        subset_identifier in more_identifiers_doc["identifiers"]
+                    )
 
                 operation = None
                 if all(subset_check):
                     operation = pymongo.DeleteOne(less_identifiers_doc)
-                    logger.debug("[Task %d] Delete 1 document: %s", task_id, less_identifiers_doc)
+                    logger.debug(
+                        "[Task %d] Delete 1 document: %s", task_id, less_identifiers_doc
+                    )
                 return operation
 
-            def _evaluate_document_intersection(more_identifiers_doc: dict, less_identifiers_doc: dict):
+            def _evaluate_document_intersection(
+                more_identifiers_doc: dict, less_identifiers_doc: dict
+            ):
                 """
                 One crucial assumption here is that at least one of these documents is has a type of
                 biolink:Protein.
@@ -562,12 +646,16 @@ def _curie_duplication_batch_handler(task_id: int, curies: list[str], collection
 
                     subset_mask = []
                     for subset_identifier in side_document["identifiers"]:
-                        subset_mask.append(subset_identifier not in main_document["identifiers"])
+                        subset_mask.append(
+                            subset_identifier not in main_document["identifiers"]
+                        )
 
                     if any(subset_mask):
                         original_document = copy.deepcopy(side_document)
                         side_document["identifiers"] = list(
-                            itertools.compress(side_document["identifiers"], subset_mask)
+                            itertools.compress(
+                                side_document["identifiers"], subset_mask
+                            )
                         )
                         operation = pymongo.ReplaceOne(original_document, side_document)
                         logger.debug(
@@ -587,9 +675,13 @@ def _curie_duplication_batch_handler(task_id: int, curies: list[str], collection
                 more_identifiers_doc = documents[1]
                 less_identifiers_doc = documents[0]
 
-            operation = _evaluate_document_subset(more_identifiers_doc, less_identifiers_doc)
+            operation = _evaluate_document_subset(
+                more_identifiers_doc, less_identifiers_doc
+            )
             if operation is None:
-                operation = _evaluate_document_intersection(more_identifiers_doc, less_identifiers_doc)
+                operation = _evaluate_document_intersection(
+                    more_identifiers_doc, less_identifiers_doc
+                )
 
             if operation is None:
                 logger.critical(
@@ -600,9 +692,13 @@ def _curie_duplication_batch_handler(task_id: int, curies: list[str], collection
             buffer.append(operation)
 
     if buffer is not None and len(buffer) > 0:
-        logger.debug("[Task %d] Bulk writing %s changes to collection", task_id, len(buffer))
+        logger.debug(
+            "[Task %d] Bulk writing %s changes to collection", task_id, len(buffer)
+        )
         collection.bulk_write(buffer)
         return task_id, len(buffer)
     else:
-        logger.debug("[Task %d] Bulk writing found no changes to collection to apply", task_id)
+        logger.debug(
+            "[Task %d] Bulk writing found no changes to collection to apply", task_id
+        )
         return task_id, 0

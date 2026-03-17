@@ -20,7 +20,6 @@ from .static import (
     NODENORM_FILE_COLLECTION,
 )
 
-
 logger = config.logger
 
 
@@ -41,7 +40,13 @@ class NodeNormDumper(LastModifiedHTTPDumper):
     ARCHIVE = False
     SCHEDULE = None
 
-    def __init__(self, src_name: str = None, src_root_folder: str = None, log_folder: str = None, archive: bool = None):
+    def __init__(
+        self,
+        src_name: str = None,
+        src_root_folder: str = None,
+        log_folder: str = None,
+        archive: bool = None,
+    ):
         super().__init__(src_name, src_root_folder, log_folder, archive)
         self.to_dump_large = []
 
@@ -65,7 +70,9 @@ class NodeNormDumper(LastModifiedHTTPDumper):
                 }
             )
 
-        for nodenorm_file, file_partitions in file_collections["compendia-large"].items():
+        for nodenorm_file, file_partitions in file_collections[
+            "compendia-large"
+        ].items():
             self.to_dump_large.append(
                 {
                     "remoteurl": f"{BASE_URL}/compendia/{nodenorm_file}",
@@ -92,7 +99,9 @@ class NodeNormDumper(LastModifiedHTTPDumper):
             pinfo["step"] = "dump"
             pinfo["description"] = remote
 
-            job = await job_manager.defer_to_process(pinfo, partial(self.download, remote, local))
+            job = await job_manager.defer_to_process(
+                pinfo, partial(self.download, remote, local)
+            )
             jobs.append(job)
 
         await asyncio.gather(*jobs)
@@ -107,32 +116,52 @@ class NodeNormDumper(LastModifiedHTTPDumper):
             pinfo["step"] = "dump"
             pinfo["description"] = file_mapping["remoteurl"]
 
-            job = await job_manager.defer_to_process(pinfo, partial(self.large_download, **file_mapping))
+            job = await job_manager.defer_to_process(
+                pinfo, partial(self.large_download, **file_mapping)
+            )
             jobs.append(job)
         await asyncio.gather(*jobs)
         self.to_dump_large = []
 
-    def large_download(self, remoteurl: str, localfile: [str, Path], num_partitions: int = 100) -> None:
+    def large_download(
+        self, remoteurl: str, localfile: [str, Path], num_partitions: int = 100
+    ) -> None:
         """
         Handles downloading of particularly large files. It breaks it into further smaller
         chunks
         """
-        logger.info("Downloading (large) file %s -> %s | Partitions %s", remoteurl, localfile, num_partitions)
+        logger.info(
+            "Downloading (large) file %s -> %s | Partitions %s",
+            remoteurl,
+            localfile,
+            num_partitions,
+        )
         self.prepare_local_folders(localfile)
 
         thread_futures = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1 * os.cpu_count()) as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1 * os.cpu_count()
+        ) as executor:
             chunks, chunk_size = self.get_range_chunks(remoteurl, num_partitions)
 
             for index, chunk_start in enumerate(chunks):
                 chunk_end = chunk_start + (chunk_size - 1)
                 output_chunk = f"{localfile}.part{index}"
 
-                arguments = {"url": remoteurl, "start": chunk_start, "end": chunk_end, "output": output_chunk}
+                arguments = {
+                    "url": remoteurl,
+                    "start": chunk_start,
+                    "end": chunk_end,
+                    "output": output_chunk,
+                }
                 future = executor.submit(self.download_range, **arguments)
                 thread_futures.append(future)
 
-            concurrent.futures.wait(thread_futures, timeout=None, return_when=concurrent.futures.ALL_COMPLETED)
+            concurrent.futures.wait(
+                thread_futures,
+                timeout=None,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
             with open(localfile, "wb") as combined_output:
                 for index in range(len(chunks)):
                     chunk_path = f"{localfile}.part{index}"
@@ -142,29 +171,47 @@ class NodeNormDumper(LastModifiedHTTPDumper):
                     os.remove(chunk_path)
                 logger.info(f"Combined all chunks -> {localfile}")
 
-    def download(self, remoteurl: str, localfile: Union[str, Path], headers: dict = {}) -> None:
+    def download(
+        self, remoteurl: str, localfile: Union[str, Path], headers: dict = {}
+    ) -> None:
         """
         Handles downloading of remote files over HTTP to the local file system
 
         Leverages multiple threads to download the remote file in multiple chunks
         concurrently and then combines them at the end
         """
-        logger.info("Downloading (normal) file %s -> %s | Partitions %s", remoteurl, localfile, 10)
+        logger.info(
+            "Downloading (normal) file %s -> %s | Partitions %s",
+            remoteurl,
+            localfile,
+            10,
+        )
         self.prepare_local_folders(localfile)
 
         thread_futures = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1 * os.cpu_count()) as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1 * os.cpu_count()
+        ) as executor:
             chunks, chunk_size = self.get_range_chunks(remoteurl, 10)
 
             for index, chunk_start in enumerate(chunks):
                 chunk_end = chunk_start + (chunk_size - 1)
                 output_chunk = f"{localfile}.part{index}"
 
-                arguments = {"url": remoteurl, "start": chunk_start, "end": chunk_end, "output": output_chunk}
+                arguments = {
+                    "url": remoteurl,
+                    "start": chunk_start,
+                    "end": chunk_end,
+                    "output": output_chunk,
+                }
                 future = executor.submit(self.download_range, **arguments)
                 thread_futures.append(future)
 
-            concurrent.futures.wait(thread_futures, timeout=None, return_when=concurrent.futures.ALL_COMPLETED)
+            concurrent.futures.wait(
+                thread_futures,
+                timeout=None,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
             with open(localfile, "wb") as combined_output:
                 for index in range(len(chunks)):
                     chunk_path = f"{localfile}.part{index}"
@@ -227,7 +274,9 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         data_directory = Path(local_zip_file).parent
         self._generate_conflation_database(data_directory)
 
-    def _generate_conflation_database(self, data_directory: Union[str, Path]) -> Union[str, Path]:
+    def _generate_conflation_database(
+        self, data_directory: Union[str, Path]
+    ) -> Union[str, Path]:
         """
         Takes the generated conflation files and creates a sqlite3 database used for looking
         up the conflation identifiers for the supported types of nodes
@@ -244,7 +293,9 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         identifier3 | identifer0,identifer1,identifer2,identifer3,identifer4
         identifier4 | identifer0,identifer1,identifer2,identifer3,identifer4
         """
-        conflation_database_path = data_directory.joinpath(CONFLATION_LOOKUP_DATABASE).resolve().absolute()
+        conflation_database_path = (
+            data_directory.joinpath(CONFLATION_LOOKUP_DATABASE).resolve().absolute()
+        )
         conflation_database = sqlite3.connect(conflation_database_path)
         cursor = conflation_database.cursor()
 
@@ -283,15 +334,25 @@ class NodeNormDumper(LastModifiedHTTPDumper):
                     identifiers_repr = ",".join(cleaned_identifiers)
                     for identifier in cleaned_identifiers:
                         batch.append(
-                            {"conflation": identifier, "identifiers": identifiers_repr, "type": conflation_file.stem}
+                            {
+                                "conflation": identifier,
+                                "identifiers": identifiers_repr,
+                                "type": conflation_file.stem,
+                            }
                         )
 
                     if len(batch) >= 10000:
-                        cursor.executemany("INSERT INTO conflations VALUES (:conflation, :identifiers, :type)", batch)
+                        cursor.executemany(
+                            "INSERT INTO conflations VALUES (:conflation, :identifiers, :type)",
+                            batch,
+                        )
                         batch = []
 
         if len(batch) > 0:
-            cursor.executemany("INSERT INTO conflations VALUES (:conflation, :identifiers, :type)", batch)
+            cursor.executemany(
+                "INSERT INTO conflations VALUES (:conflation, :identifiers, :type)",
+                batch,
+            )
             batch = []
         conflation_database.commit()
         conflation_database.close()

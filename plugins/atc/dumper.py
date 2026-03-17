@@ -10,13 +10,14 @@ import bs4
 import biothings
 from biothings import config
 
-
 logger = config.logger
 
 
 class ATCDumper(biothings.hub.dataload.dumper.LastModifiedHTTPDumper):
     SRC_NAME = "atc"
-    SRC_URLS = ["https://raw.githubusercontent.com/fabkury/atcd/master/WHO%20ATC-DDD%202021-12-03.csv"]
+    SRC_URLS = [
+        "https://raw.githubusercontent.com/fabkury/atcd/master/WHO%20ATC-DDD%202021-12-03.csv"
+    ]
     SRC_ROOT_FOLDER = Path(config.DATA_ARCHIVE_ROOT) / SRC_NAME
     SCHEDULE = None
     UNCOMPRESS = False

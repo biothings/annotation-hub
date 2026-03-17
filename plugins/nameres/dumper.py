@@ -19,7 +19,6 @@ from .static import (
     SYNONYM_FILE_COLLECTION,
 )
 
-
 logger = config.logger
 
 
@@ -39,7 +38,13 @@ class NameResDumper(LastModifiedHTTPDumper):
     ARCHIVE = False
     SCHEDULE = None
 
-    def __init__(self, src_name: str = None, src_root_folder: str = None, log_folder: str = None, archive: bool = None):
+    def __init__(
+        self,
+        src_name: str = None,
+        src_root_folder: str = None,
+        log_folder: str = None,
+        archive: bool = None,
+    ):
         super().__init__(src_name, src_root_folder, log_folder, archive)
         self.to_dump = []
         self.to_dump_large = []
@@ -83,7 +88,9 @@ class NameResDumper(LastModifiedHTTPDumper):
             pinfo["step"] = "dump"
             pinfo["description"] = remote
 
-            job = await job_manager.defer_to_process(pinfo, partial(self.download, remote, local))
+            job = await job_manager.defer_to_process(
+                pinfo, partial(self.download, remote, local)
+            )
             jobs.append(job)
 
         await asyncio.gather(*jobs)
@@ -98,17 +105,26 @@ class NameResDumper(LastModifiedHTTPDumper):
             pinfo["step"] = "dump"
             pinfo["description"] = file_mapping["remoteurl"]
 
-            job = await job_manager.defer_to_process(pinfo, partial(self.large_download, **file_mapping))
+            job = await job_manager.defer_to_process(
+                pinfo, partial(self.large_download, **file_mapping)
+            )
             jobs.append(job)
         await asyncio.gather(*jobs)
         self.to_dump_large = []
 
-    def large_download(self, remoteurl: str, localfile: [str, Path], num_partitions: int = 100) -> None:
+    def large_download(
+        self, remoteurl: str, localfile: [str, Path], num_partitions: int = 100
+    ) -> None:
         """
         Handles downloading of particularly large files. It breaks it into further smaller
         chunks
         """
-        logger.info("Downloading (large) file %s -> %s | Partitions %s", remoteurl, localfile, num_partitions)
+        logger.info(
+            "Downloading (large) file %s -> %s | Partitions %s",
+            remoteurl,
+            localfile,
+            num_partitions,
+        )
         self.prepare_local_folders(localfile)
 
         thread_futures = []
@@ -120,11 +136,20 @@ class NameResDumper(LastModifiedHTTPDumper):
                 chunk_end = chunk_start + (chunk_size - 1)
                 output_chunk = f"{localfile}.part{index}"
 
-                arguments = {"url": remoteurl, "start": chunk_start, "end": chunk_end, "output": output_chunk}
+                arguments = {
+                    "url": remoteurl,
+                    "start": chunk_start,
+                    "end": chunk_end,
+                    "output": output_chunk,
+                }
                 future = executor.submit(self.download_range, **arguments)
                 thread_futures.append(future)
 
-            concurrent.futures.wait(thread_futures, timeout=None, return_when=concurrent.futures.ALL_COMPLETED)
+            concurrent.futures.wait(
+                thread_futures,
+                timeout=None,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
 
             with open(localfile, "wb") as combined_output:
                 for index in range(len(chunks)):
@@ -135,7 +160,9 @@ class NameResDumper(LastModifiedHTTPDumper):
                     os.remove(chunk_path)
                 logger.info(f"Combined all chunks -> {localfile}")
 
-    def download(self, remoteurl: str, localfile: Union[str, Path], headers: dict = None) -> None:
+    def download(
+        self, remoteurl: str, localfile: Union[str, Path], headers: dict = None
+    ) -> None:
         """
         Handles downloading of remote files over HTTP to the local file system
 
@@ -145,7 +172,12 @@ class NameResDumper(LastModifiedHTTPDumper):
         if headers is None:
             headers = {}
 
-        logger.info("Downloading (normal) file %s -> %s | Partitions %s", remoteurl, localfile, 10)
+        logger.info(
+            "Downloading (normal) file %s -> %s | Partitions %s",
+            remoteurl,
+            localfile,
+            10,
+        )
         self.prepare_local_folders(localfile)
         num_partitions = 2
 
@@ -158,11 +190,20 @@ class NameResDumper(LastModifiedHTTPDumper):
                 chunk_end = chunk_start + (chunk_size - 1)
                 output_chunk = f"{localfile}.part{index}"
 
-                arguments = {"url": remoteurl, "start": chunk_start, "end": chunk_end, "output": output_chunk}
+                arguments = {
+                    "url": remoteurl,
+                    "start": chunk_start,
+                    "end": chunk_end,
+                    "output": output_chunk,
+                }
                 future = executor.submit(self.download_range, **arguments)
                 thread_futures.append(future)
 
-            concurrent.futures.wait(thread_futures, timeout=None, return_when=concurrent.futures.ALL_COMPLETED)
+            concurrent.futures.wait(
+                thread_futures,
+                timeout=None,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
             with open(localfile, "wb") as combined_output:
                 for index in range(len(chunks)):
                     chunk_path = f"{localfile}.part{index}"
@@ -228,17 +269,27 @@ class NameResDumper(LastModifiedHTTPDumper):
 
         def decompress_file(archive_file: Union[str, Path]) -> None:
             decompressed_file = archive_file.with_name(archive_file.stem)
-            with gzip.open(archive_file, "rb") as input_handle, open(decompressed_file, "wb") as output_handle:
-                logger.info("Decompressing %s -> %s", archive_file.name, decompressed_file.name)
+            with gzip.open(archive_file, "rb") as input_handle, open(
+                decompressed_file, "wb"
+            ) as output_handle:
+                logger.info(
+                    "Decompressing %s -> %s", archive_file.name, decompressed_file.name
+                )
                 shutil.copyfileobj(input_handle, output_handle)
             logger.debug("Deleting archive file %s", archive_file.name)
             archive_file.unlink()
 
         thread_futures = []
         data_directory = Path(self.current_data_folder).resolve().absolute()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=os.cpu_count()
+        ) as executor:
             for archive_file in data_directory.glob("**/*.gz"):
                 arguments = {"archive_file": archive_file}
                 future = executor.submit(decompress_file, **arguments)
                 thread_futures.append(future)
-            concurrent.futures.wait(thread_futures, timeout=None, return_when=concurrent.futures.ALL_COMPLETED)
+            concurrent.futures.wait(
+                thread_futures,
+                timeout=None,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )

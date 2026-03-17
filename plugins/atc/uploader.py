@@ -11,7 +11,6 @@ import logging
 import biothings
 import biothings.hub
 
-
 logger = biothings.config.logger
 
 
@@ -67,7 +66,11 @@ class ATCUploader(biothings.hub.dataload.uploader.IgnoreDuplicatedSourceUploader
                     yield document
             except csv.Error as csv_error:
                 logger.exception(csv_error)
-                logger.error("Issue discovered with file %s @ line %s", data_file, dict_transformer.line_num)
+                logger.error(
+                    "Issue discovered with file %s @ line %s",
+                    data_file,
+                    dict_transformer.line_num,
+                )
 
     @classmethod
     def get_mapping(self) -> dict:
@@ -88,7 +91,10 @@ class ATCUploader(biothings.hub.dataload.uploader.IgnoreDuplicatedSourceUploader
         elasticsearch_mapping = {
             "atc": {
                 "properties": {
-                    "code": {"type": "keyword", "normalizer": "keyword_lowercase_normalizer"},
+                    "code": {
+                        "type": "keyword",
+                        "normalizer": "keyword_lowercase_normalizer",
+                    },
                     "name": {"type": "text"},
                 }
             }
