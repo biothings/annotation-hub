@@ -205,3 +205,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# local-hub directories
+.biothings_hub
+
+# configuration
+config.py
+config_hub.py
+bin/ssh_host_key
+bin/ssh_host_key.pub

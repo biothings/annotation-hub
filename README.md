@@ -1,2 +1,2 @@
-# annotation-hub
-A BioThings Hub to aggregation Knowledge graph node-level annotations
+# core-hub
+A BioThings-Hub to aggregate knowledge graph node-level data for our core-components services
