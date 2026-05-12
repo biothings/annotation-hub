@@ -28,13 +28,14 @@ from .static import (
 )
 
 logger = config.logger
+NODENORM_WORKER_COUNT = 30
 
 
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     create_identifiers_table(data_folder)
 
     with concurrent.futures.ProcessPoolExecutor(
-        max_workers=1 * os.cpu_count()
+        max_workers=NODENORM_WORKER_COUNT
     ) as executor:
         process_futures = []
         for index, task in enumerate(_build_offset_tasks(data_folder, collection_name)):
@@ -470,7 +471,7 @@ def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: st
     identifier_connection.close()
 
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=1 * os.cpu_count()
+        max_workers=NODENORM_WORKER_COUNT
     ) as executor:
         process_futures = []
         for index, curie_batch in enumerate(iter_n(duplicate_curies, 1000)):
