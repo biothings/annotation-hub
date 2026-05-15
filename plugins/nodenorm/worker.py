@@ -446,7 +446,9 @@ def update_identifier_collection(data_folder: Union[str, Path], identifiers: lis
         "ON CONFLICT(identifier) "
         "DO UPDATE SET count=count+1;"
     )
-    identifier_information = [{"identifier": identifier} for identifier in identifiers]
+    identifier_information = (
+        {"identifier": identifier} for identifier in identifiers
+    )
 
     cursor.executemany(upsert_statement, identifier_information)
     identifier_connection.commit()
