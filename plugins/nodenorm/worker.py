@@ -37,15 +37,18 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=NODENORM_WORKER_COUNT
     ) as executor:
-        process_futures = []
+        process_futures = set()
         for index, task in enumerate(_build_offset_tasks(data_folder, collection_name)):
             future = executor.submit(subset_upload_worker, **task)
-            process_futures.append(future)
+            process_futures.add(future)
 
         total_document_count = 0
         for index, future in enumerate(
             concurrent.futures.as_completed(process_futures)
         ):
+            # Completed futures retain their result; drop our reference before
+            # waiting on the next upload task.
+            process_futures.discard(future)
             try:
                 identifiers = future.result()
             except Exception as gen_exc:
@@ -61,6 +64,7 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
                     total_document_count,
                 )
                 del identifiers
+                del future
 
     create_mongo_identifiers_index(collection_name)
     create_identifiers_index(data_folder)
