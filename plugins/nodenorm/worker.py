@@ -30,7 +30,7 @@ from .static import (
 
 logger = config.logger
 NODENORM_WORKER_COUNT = 30
-NODENORM_MAX_TASKS_PER_CHILD = 8
+NODENORM_MAX_TASKS_PER_CHILD = 4
 
 
 def _get_process_context():
