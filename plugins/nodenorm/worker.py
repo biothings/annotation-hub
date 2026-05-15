@@ -3,6 +3,7 @@ import copy
 import hashlib
 import itertools
 import json
+import multiprocessing
 import os
 import sqlite3
 import time
@@ -29,13 +30,24 @@ from .static import (
 
 logger = config.logger
 NODENORM_WORKER_COUNT = 30
+NODENORM_MAX_TASKS_PER_CHILD = 8
+
+
+def _get_process_context():
+    if "forkserver" in multiprocessing.get_all_start_methods():
+        return multiprocessing.get_context("forkserver")
+
+    return multiprocessing.get_context("spawn")
 
 
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     create_identifiers_table(data_folder)
 
+    process_context = _get_process_context()
     with concurrent.futures.ProcessPoolExecutor(
-        max_workers=NODENORM_WORKER_COUNT
+        max_workers=NODENORM_WORKER_COUNT,
+        mp_context=process_context,
+        max_tasks_per_child=NODENORM_MAX_TASKS_PER_CHILD,
     ) as executor:
         process_futures = set()
         for index, task in enumerate(_build_offset_tasks(data_folder, collection_name)):
@@ -398,7 +410,7 @@ def create_identifiers_table(data_folder: Union[str, Path]) -> None:
     identifier_database = (
         Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
     )
-    identifier_connection = sqlite3.connect(str(identifier_database))
+    identifier_connection = _connect_identifier_database(identifier_database)
     cursor = identifier_connection.cursor()
     identifier_existence_check = "DROP TABLE IF EXISTS identifiers"
     cursor.execute(identifier_existence_check)
@@ -414,7 +426,7 @@ def create_identifiers_index(data_folder: Union[str, Path]) -> None:
     identifier_database = (
         Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
     )
-    identifier_connection = sqlite3.connect(str(identifier_database))
+    identifier_connection = _connect_identifier_database(identifier_database)
     cursor = identifier_connection.cursor()
 
     identifier_index = (
@@ -434,14 +446,23 @@ def create_mongo_identifiers_index(collection_name: str) -> None:
     collection.create_index("identifiers.i")
 
 
+def _connect_identifier_database(identifier_database: Union[str, Path]):
+    identifier_connection = sqlite3.connect(str(identifier_database))
+    identifier_connection.execute("PRAGMA journal_mode=WAL")
+    identifier_connection.execute("PRAGMA synchronous=NORMAL")
+    return identifier_connection
+
+
 def update_identifier_collection(data_folder: Union[str, Path], identifiers: list[str]):
     """
     Temporarily stopgap to identify our CURIE duplication issue
 
     Stores all identifiers in a sqlite3 database for post-update fixing
     """
-    identifier_database = Path(data_folder).joinpath(IDENTIFIER_LOOKUP_DATABASE)
-    identifier_connection = sqlite3.connect(str(identifier_database))
+    identifier_database = (
+        Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
+    )
+    identifier_connection = _connect_identifier_database(identifier_database)
     cursor = identifier_connection.cursor()
 
     upsert_statement = (
