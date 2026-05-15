@@ -3,8 +3,11 @@ import copy
 import hashlib
 import itertools
 import json
+import multiprocessing
 import os
+import queue
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -29,47 +32,92 @@ from .static import (
 
 logger = config.logger
 NODENORM_WORKER_COUNT = 30
+NODENORM_IDENTIFIER_BATCH_SIZE = 50_000
+NODENORM_IDENTIFIER_QUEUE_SIZE = 2 * NODENORM_WORKER_COUNT
+IDENTIFIER_WRITER_STOP = None
+IDENTIFIER_QUEUE = None
+IDENTIFIER_WRITER_FAILED = None
 
 
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     create_identifiers_table(data_folder)
 
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=NODENORM_WORKER_COUNT
-    ) as executor:
-        process_futures = set()
-        for index, task in enumerate(_build_offset_tasks(data_folder, collection_name)):
-            future = executor.submit(subset_upload_worker, **task)
-            process_futures.add(future)
+    process_context = multiprocessing.get_context()
+    identifier_queue = process_context.Queue(maxsize=NODENORM_IDENTIFIER_QUEUE_SIZE)
+    identifier_writer_failed = process_context.Event()
+    identifier_writer_errors = []
+    identifier_writer = threading.Thread(
+        target=_write_identifier_batches,
+        args=(
+            data_folder,
+            identifier_queue,
+            identifier_writer_failed,
+            identifier_writer_errors,
+        ),
+        name="nodenorm-identifier-writer",
+    )
+    identifier_writer_started = False
 
-        total_document_count = 0
-        for index, future in enumerate(
-            concurrent.futures.as_completed(process_futures)
-        ):
-            # Completed futures retain their result; drop our reference before
-            # waiting on the next upload task.
-            process_futures.discard(future)
-            try:
-                identifiers = future.result()
-            except Exception as gen_exc:
-                logger.exception(gen_exc)
-                raise gen_exc
-            else:
-                update_identifier_collection(data_folder, identifiers)
-                total_document_count += len(identifiers)
-                logger.debug(
-                    "Task %s completed | Update %s identifiers | Total identifiers %s",
-                    index,
-                    len(identifiers),
-                    total_document_count,
-                )
-                del identifiers
-                del future
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=NODENORM_WORKER_COUNT,
+            initializer=_configure_identifier_writer,
+            initargs=(identifier_queue, identifier_writer_failed),
+        ) as executor:
+            process_futures = set()
+            for index, task in enumerate(
+                _build_offset_tasks(data_folder, collection_name)
+            ):
+                future = executor.submit(subset_upload_worker, **task)
+                process_futures.add(future)
+
+            identifier_writer.start()
+            identifier_writer_started = True
+
+            total_document_count = 0
+            for index, future in enumerate(
+                concurrent.futures.as_completed(process_futures)
+            ):
+                # Completed futures retain their result; drop our reference
+                # before waiting on the next upload task.
+                process_futures.discard(future)
+                try:
+                    identifier_count = future.result()
+                except Exception as gen_exc:
+                    logger.exception(gen_exc)
+                    raise gen_exc
+                else:
+                    total_document_count += identifier_count
+                    logger.debug(
+                        "Task %s completed | Update %s identifiers | Total identifiers %s",
+                        index,
+                        identifier_count,
+                        total_document_count,
+                    )
+                    del identifier_count
+                    del future
+    finally:
+        if identifier_writer_started and not identifier_writer_failed.is_set():
+            identifier_queue.put(IDENTIFIER_WRITER_STOP)
+        if identifier_writer_started:
+            identifier_writer.join()
+        identifier_queue.close()
+        identifier_queue.join_thread()
+
+    if identifier_writer_errors:
+        raise identifier_writer_errors[0]
 
     create_mongo_identifiers_index(collection_name)
     create_identifiers_index(data_folder)
     cleanup_curie_duplication(data_folder, collection_name)
     return int(total_document_count)
+
+
+def _configure_identifier_writer(identifier_queue, identifier_writer_failed):
+    global IDENTIFIER_QUEUE, IDENTIFIER_WRITER_FAILED
+
+    IDENTIFIER_QUEUE = identifier_queue
+    IDENTIFIER_WRITER_FAILED = identifier_writer_failed
 
 
 def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
@@ -223,7 +271,7 @@ def subset_upload_worker(
     offset_end: int,
     collection_name: str,
     conflation_database: str = None,
-) -> list[str]:
+) -> int:
     """
     Internal function for handling the multipart uploading of the file in partitions
 
@@ -254,7 +302,8 @@ def subset_upload_worker(
 
     with open(input_file, encoding="utf-8") as file_handle:
         buffer = []
-        identifiers = []
+        identifier_batch = []
+        identifier_count = 0
         canonical_identifiers = []
         file_handle.seek(offset_start)
         while file_handle.tell() < offset_end:
@@ -272,7 +321,11 @@ def subset_upload_worker(
             buffer.append(doc)
 
             for identifier in doc["identifiers"]:
-                identifiers.append(identifier["i"])
+                identifier_batch.append(identifier["i"])
+                identifier_count += 1
+                if len(identifier_batch) >= NODENORM_IDENTIFIER_BATCH_SIZE:
+                    _queue_identifier_batch(identifier_batch)
+                    identifier_batch = []
                 identifier["c"] = {"gp": None, "dc": None}
 
             if len(buffer) >= buffer_size:
@@ -294,7 +347,29 @@ def subset_upload_worker(
             _upload_buffer(
                 collection, buffer, input_file, file_handle.tell() / offset_end
             )
-    return identifiers
+        if identifier_batch:
+            _queue_identifier_batch(identifier_batch)
+    return identifier_count
+
+
+def _queue_identifier_batch(identifier_batch):
+    """
+    Send a bounded identifier batch to the SQLite writer.
+
+    A timeout lets workers notice a writer failure instead of blocking forever on
+    a full queue.
+    """
+    if IDENTIFIER_QUEUE is None or IDENTIFIER_WRITER_FAILED is None:
+        raise RuntimeError("Identifier writer queue was not configured")
+
+    while True:
+        if IDENTIFIER_WRITER_FAILED.is_set():
+            raise RuntimeError("Identifier writer failed; aborting upload worker")
+        try:
+            IDENTIFIER_QUEUE.put(identifier_batch, timeout=5)
+            return
+        except queue.Full:
+            continue
 
 
 def _update_buffer_with_conflations(
@@ -434,16 +509,42 @@ def create_mongo_identifiers_index(collection_name: str) -> None:
     collection.create_index("identifiers.i")
 
 
-def update_identifier_collection(data_folder: Union[str, Path], identifiers: list[str]):
+def _write_identifier_batches(
+    data_folder: Union[str, Path],
+    identifier_queue,
+    identifier_writer_failed,
+    identifier_writer_errors: list[Exception],
+):
     """
-    Temporarily stopgap to identify our CURIE duplication issue
-
-    Stores all identifiers in a sqlite3 database for post-update fixing
+    Own the SQLite identifier connection and persist streamed worker batches.
     """
     identifier_database = Path(data_folder).joinpath(IDENTIFIER_LOOKUP_DATABASE)
-    identifier_connection = sqlite3.connect(str(identifier_database))
-    cursor = identifier_connection.cursor()
+    identifier_connection = None
 
+    try:
+        identifier_connection = sqlite3.connect(str(identifier_database))
+        cursor = identifier_connection.cursor()
+
+        while True:
+            identifier_batch = identifier_queue.get()
+            if identifier_batch is IDENTIFIER_WRITER_STOP:
+                break
+
+            update_identifier_collection(cursor, identifier_batch)
+            identifier_connection.commit()
+    except Exception as write_exception:
+        identifier_writer_failed.set()
+        identifier_writer_errors.append(write_exception)
+        logger.exception(write_exception)
+    finally:
+        if identifier_connection is not None:
+            identifier_connection.close()
+
+
+def update_identifier_collection(cursor: sqlite3.Cursor, identifiers: list[str]):
+    """
+    Stores an identifier batch in sqlite3 for post-update duplicate cleanup.
+    """
     upsert_statement = (
         "INSERT INTO identifiers(identifier) "
         "VALUES(:identifier) "
@@ -455,8 +556,6 @@ def update_identifier_collection(data_folder: Union[str, Path], identifiers: lis
     )
 
     cursor.executemany(upsert_statement, identifier_information)
-    identifier_connection.commit()
-    identifier_connection.close()
 
 
 def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: str):
