@@ -41,6 +41,8 @@ def _get_process_context():
 
 
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
+    os.environ["SQLITE_TMPDIR"] = "/data/annotator/sqlite_tmp"
+
     create_identifiers_table(data_folder)
 
     process_context = _get_process_context()
