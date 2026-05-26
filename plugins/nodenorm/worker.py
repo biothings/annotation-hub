@@ -30,7 +30,10 @@ from .static import (
 
 logger = config.logger
 NODENORM_WORKER_COUNT = 30
-NODENORM_MAX_TASKS_PER_CHILD = 4
+NODENORM_TASKS_PER_WORKER_RESTART = 4
+NODENORM_TASKS_PER_POOL = (
+    NODENORM_WORKER_COUNT * NODENORM_TASKS_PER_WORKER_RESTART
+)
 
 
 def _get_process_context():
@@ -46,39 +49,55 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     create_identifiers_table(data_folder)
 
     process_context = _get_process_context()
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=NODENORM_WORKER_COUNT,
-        mp_context=process_context,
-        max_tasks_per_child=NODENORM_MAX_TASKS_PER_CHILD,
-    ) as executor:
-        process_futures = set()
-        for index, task in enumerate(_build_offset_tasks(data_folder, collection_name)):
-            future = executor.submit(subset_upload_worker, **task)
-            process_futures.add(future)
+    upload_tasks = list(_build_offset_tasks(data_folder, collection_name))
 
-        total_document_count = 0
-        for index, future in enumerate(
-            concurrent.futures.as_completed(process_futures)
-        ):
-            # Completed futures retain their result; drop our reference before
-            # waiting on the next upload task.
-            process_futures.discard(future)
-            try:
-                identifiers = future.result()
-            except Exception as gen_exc:
-                logger.exception(gen_exc)
-                raise gen_exc
-            else:
-                update_identifier_collection(data_folder, identifiers)
-                total_document_count += len(identifiers)
-                logger.debug(
-                    "Task %s completed | Update %s identifiers | Total identifiers %s",
-                    index,
-                    len(identifiers),
-                    total_document_count,
-                )
-                del identifiers
-                del future
+    total_document_count = 0
+    completed_task_count = 0
+    for wave_index, task_batch in enumerate(
+        iter_n(upload_tasks, NODENORM_TASKS_PER_POOL), start=1
+    ):
+        logger.info(
+            "Starting nodenorm upload wave %s with %s task(s)",
+            wave_index,
+            len(task_batch),
+        )
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=NODENORM_WORKER_COUNT,
+            mp_context=process_context,
+        ) as executor:
+            process_futures = set()
+            for task in task_batch:
+                future = executor.submit(subset_upload_worker, **task)
+                process_futures.add(future)
+
+            for future in concurrent.futures.as_completed(process_futures):
+                # Completed futures retain their result; drop our reference
+                # before waiting on the next upload task.
+                process_futures.discard(future)
+                try:
+                    identifiers = future.result()
+                except Exception as gen_exc:
+                    logger.exception(gen_exc)
+                    raise gen_exc
+                else:
+                    update_identifier_collection(data_folder, identifiers)
+                    total_document_count += len(identifiers)
+                    completed_task_count += 1
+                    logger.debug(
+                        "Task %s completed | Update %s identifiers | Total identifiers %s",
+                        completed_task_count,
+                        len(identifiers),
+                        total_document_count,
+                    )
+                    del identifiers
+                    del future
+        logger.info(
+            "Completed nodenorm upload wave %s | Completed tasks %s/%s | Total identifiers %s",
+            wave_index,
+            completed_task_count,
+            len(upload_tasks),
+            total_document_count,
+        )
 
     create_mongo_identifiers_index(collection_name)
     create_identifiers_index(data_folder)
