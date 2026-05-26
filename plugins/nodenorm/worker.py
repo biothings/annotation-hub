@@ -34,6 +34,7 @@ NODENORM_TASKS_PER_WORKER_RESTART = 4
 NODENORM_TASKS_PER_POOL = (
     NODENORM_WORKER_COUNT * NODENORM_TASKS_PER_WORKER_RESTART
 )
+NODENORM_MAX_IN_FLIGHT_TASKS = 2 * NODENORM_WORKER_COUNT
 
 
 def _get_process_context():
@@ -50,6 +51,15 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
 
     process_context = _get_process_context()
     upload_tasks = list(_build_offset_tasks(data_folder, collection_name))
+    total_task_count = len(upload_tasks)
+    upload_tasks = [
+        {
+            **task,
+            "task_index": task_index,
+            "total_task_count": total_task_count,
+        }
+        for task_index, task in enumerate(upload_tasks, start=1)
+    ]
 
     total_document_count = 0
     completed_task_count = 0
@@ -65,32 +75,52 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
             max_workers=NODENORM_WORKER_COUNT,
             mp_context=process_context,
         ) as executor:
-            process_futures = set()
-            for task in task_batch:
+            future_tasks = {}
+            task_iterator = iter(task_batch)
+            for task in itertools.islice(task_iterator, NODENORM_MAX_IN_FLIGHT_TASKS):
                 future = executor.submit(subset_upload_worker, **task)
-                process_futures.add(future)
+                future_tasks[future] = task
 
-            for future in concurrent.futures.as_completed(process_futures):
-                # Completed futures retain their result; drop our reference
-                # before waiting on the next upload task.
-                process_futures.discard(future)
-                try:
-                    identifiers = future.result()
-                except Exception as gen_exc:
-                    logger.exception(gen_exc)
-                    raise gen_exc
-                else:
-                    update_identifier_collection(data_folder, identifiers)
-                    total_document_count += len(identifiers)
-                    completed_task_count += 1
-                    logger.debug(
-                        "Task %s completed | Update %s identifiers | Total identifiers %s",
-                        completed_task_count,
-                        len(identifiers),
-                        total_document_count,
-                    )
-                    del identifiers
-                    del future
+            while future_tasks:
+                done_futures, _ = concurrent.futures.wait(
+                    future_tasks, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done_futures:
+                    # Completed futures retain their result; drop our reference
+                    # before waiting on the next upload task.
+                    task = future_tasks.pop(future)
+                    try:
+                        identifiers = future.result()
+                    except Exception as gen_exc:
+                        logger.exception(
+                            "Upload task failed | %s",
+                            _describe_upload_task(task),
+                        )
+                        _log_pending_upload_tasks(future_tasks.values())
+                        raise gen_exc
+                    else:
+                        update_identifier_collection(data_folder, identifiers)
+                        total_document_count += len(identifiers)
+                        completed_task_count += 1
+                        logger.debug(
+                            "Task %s/%s completed | Update %s identifiers | Total identifiers %s",
+                            task["task_index"],
+                            total_task_count,
+                            len(identifiers),
+                            total_document_count,
+                        )
+                        del identifiers
+                        del future
+
+                        try:
+                            next_task = next(task_iterator)
+                        except StopIteration:
+                            continue
+
+                        next_future = executor.submit(
+                            subset_upload_worker, **next_task
+                        )
+                        future_tasks[next_future] = next_task
         logger.info(
             "Completed nodenorm upload wave %s | Completed tasks %s/%s | Total identifiers %s",
             wave_index,
@@ -103,6 +133,33 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     create_identifiers_index(data_folder)
     cleanup_curie_duplication(data_folder, collection_name)
     return int(total_document_count)
+
+
+def _describe_upload_task(task: dict) -> str:
+    input_file = Path(task["input_file"])
+    return (
+        f"task {task.get('task_index')}/{task.get('total_task_count')} "
+        f"file={input_file.name} offsets={task['offset_start']}:{task['offset_end']}"
+    )
+
+
+def _log_pending_upload_tasks(tasks) -> None:
+    task_descriptions = [_describe_upload_task(task) for task in tasks]
+    if not task_descriptions:
+        logger.error("No pending upload tasks remain after failure")
+        return
+
+    preview = task_descriptions[:10]
+    logger.error(
+        "Pending upload tasks after failure (%s total): %s",
+        len(task_descriptions),
+        "; ".join(preview),
+    )
+    if len(task_descriptions) > len(preview):
+        logger.error(
+            "Omitted %s additional pending upload task(s) from failure log",
+            len(task_descriptions) - len(preview),
+        )
 
 
 def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
@@ -256,6 +313,8 @@ def subset_upload_worker(
     offset_end: int,
     collection_name: str,
     conflation_database: str = None,
+    task_index: int = None,
+    total_task_count: int = None,
 ) -> list[str]:
     """
     Internal function for handling the multipart uploading of the file in partitions
@@ -271,7 +330,9 @@ def subset_upload_worker(
     the nodenorm files
     """
     logger.info(
-        "Starting bulk upload to backend %s [%s|%s]",
+        "Starting bulk upload task %s/%s to backend %s [%s|%s]",
+        task_index,
+        total_task_count,
         input_file,
         offset_start,
         offset_end,
@@ -314,7 +375,14 @@ def subset_upload_worker(
                         buffer, canonical_identifiers, conflation_connection
                     )
                 _upload_buffer(
-                    collection, buffer, input_file, file_handle.tell() / offset_end
+                    collection,
+                    buffer,
+                    input_file,
+                    _calculate_task_progress(
+                        file_handle.tell(), offset_start, offset_end
+                    ),
+                    task_index,
+                    total_task_count,
                 )
                 buffer = []
                 canonical_identifiers = []
@@ -325,9 +393,29 @@ def subset_upload_worker(
                     buffer, canonical_identifiers, conflation_connection
                 )
             _upload_buffer(
-                collection, buffer, input_file, file_handle.tell() / offset_end
+                collection,
+                buffer,
+                input_file,
+                _calculate_task_progress(file_handle.tell(), offset_start, offset_end),
+                task_index,
+                total_task_count,
             )
+    logger.info(
+        "Completed bulk upload task %s/%s | file %s | identifiers %s",
+        task_index,
+        total_task_count,
+        input_file,
+        len(identifiers),
+    )
     return identifiers
+
+
+def _calculate_task_progress(position: int, offset_start: int, offset_end: int):
+    task_size = offset_end - offset_start
+    if task_size <= 0:
+        return 1.0
+
+    return min(max((position - offset_start) / task_size, 0.0), 1.0)
 
 
 def _update_buffer_with_conflations(
@@ -376,15 +464,19 @@ def _upload_buffer(
     buffer: list[dict],
     input_file: Union[str, Path],
     progress: float,
+    task_index: int,
+    total_task_count: int,
 ):
     try:
         t0 = time.perf_counter()
         document_group = [pymongo.InsertOne(d) for d in buffer]
         collection.bulk_write(document_group, ordered=False)
         logger.debug(
-            "bulk write #[%d] in [%3.4f]s | file %s subset progress: %1.3f%%",
+            "bulk write #[%d] in [%3.4f]s | task %s/%s | file %s shard progress: %1.3f%%",
             len(document_group),
             time.perf_counter() - t0,
+            task_index,
+            total_task_count,
             input_file.name,
             progress * 100,
         )
