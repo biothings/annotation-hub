@@ -97,6 +97,7 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
                             "Upload task failed | %s",
                             _describe_upload_task(task),
                         )
+                        _log_executor_process_exit_codes(executor)
                         _log_pending_upload_tasks(future_tasks.values())
                         raise gen_exc
                     else:
@@ -161,6 +162,26 @@ def _log_pending_upload_tasks(tasks) -> None:
             "Omitted %s additional pending upload task(s) from failure log",
             len(task_descriptions) - len(preview),
         )
+
+
+def _log_executor_process_exit_codes(
+    executor: concurrent.futures.ProcessPoolExecutor,
+) -> None:
+    processes = getattr(executor, "_processes", None)
+    if not processes:
+        logger.error("Executor process exit codes unavailable")
+        return
+
+    exit_code_details = []
+    for process_id, process in processes.items():
+        exit_code_details.append(
+            f"pid={process_id} exitcode={process.exitcode} alive={process.is_alive()}"
+        )
+
+    logger.error(
+        "Executor process states after failure: %s",
+        "; ".join(exit_code_details),
+    )
 
 
 def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
@@ -317,6 +338,42 @@ def subset_upload_worker(
     task_index: int = None,
     total_task_count: int = None,
 ) -> list[str]:
+    worker_pid = os.getpid()
+    fault_log_path = (
+        Path("/tmp")
+        / f"nodenorm-worker-{worker_pid}-task-{task_index}.fault.log"
+    )
+    with open(fault_log_path, "w", encoding="utf-8") as fault_log:
+        faulthandler.enable(file=fault_log, all_threads=True)
+        try:
+            return _subset_upload_worker(
+                input_file=input_file,
+                buffer_size=buffer_size,
+                offset_start=offset_start,
+                offset_end=offset_end,
+                collection_name=collection_name,
+                conflation_database=conflation_database,
+                task_index=task_index,
+                total_task_count=total_task_count,
+                worker_pid=worker_pid,
+                fault_log_path=fault_log_path,
+            )
+        finally:
+            faulthandler.disable()
+
+
+def _subset_upload_worker(
+    input_file: Union[str, Path],
+    buffer_size: int,
+    offset_start: int,
+    offset_end: int,
+    collection_name: str,
+    conflation_database: str = None,
+    task_index: int = None,
+    total_task_count: int = None,
+    worker_pid: int = None,
+    fault_log_path: Union[str, Path] = None,
+) -> list[str]:
     """
     Internal function for handling the multipart uploading of the file in partitions
 
@@ -330,13 +387,12 @@ def subset_upload_worker(
     Afterwards the data processing is straight forward, we effectively don't transform the state of
     the nodenorm files
     """
-    faulthandler.enable()
-    worker_pid = os.getpid()
     logger.info(
-        "Starting bulk upload task %s/%s | pid %s | backend %s [%s|%s]",
+        "Starting bulk upload task %s/%s | pid %s | fault log %s | backend %s [%s|%s]",
         task_index,
         total_task_count,
         worker_pid,
+        fault_log_path,
         input_file,
         offset_start,
         offset_end,
