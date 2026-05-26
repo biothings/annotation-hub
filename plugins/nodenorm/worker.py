@@ -1,5 +1,6 @@
 import concurrent.futures
 import copy
+import faulthandler
 import hashlib
 import itertools
 import json
@@ -329,10 +330,13 @@ def subset_upload_worker(
     Afterwards the data processing is straight forward, we effectively don't transform the state of
     the nodenorm files
     """
+    faulthandler.enable()
+    worker_pid = os.getpid()
     logger.info(
-        "Starting bulk upload task %s/%s to backend %s [%s|%s]",
+        "Starting bulk upload task %s/%s | pid %s | backend %s [%s|%s]",
         task_index,
         total_task_count,
+        worker_pid,
         input_file,
         offset_start,
         offset_end,
@@ -383,6 +387,7 @@ def subset_upload_worker(
                     ),
                     task_index,
                     total_task_count,
+                    worker_pid,
                 )
                 buffer = []
                 canonical_identifiers = []
@@ -399,11 +404,13 @@ def subset_upload_worker(
                 _calculate_task_progress(file_handle.tell(), offset_start, offset_end),
                 task_index,
                 total_task_count,
+                worker_pid,
             )
     logger.info(
-        "Completed bulk upload task %s/%s | file %s | identifiers %s",
+        "Completed bulk upload task %s/%s | pid %s | file %s | identifiers %s",
         task_index,
         total_task_count,
+        worker_pid,
         input_file,
         len(identifiers),
     )
@@ -466,17 +473,19 @@ def _upload_buffer(
     progress: float,
     task_index: int,
     total_task_count: int,
+    worker_pid: int,
 ):
     try:
         t0 = time.perf_counter()
         document_group = [pymongo.InsertOne(d) for d in buffer]
         collection.bulk_write(document_group, ordered=False)
         logger.debug(
-            "bulk write #[%d] in [%3.4f]s | task %s/%s | file %s shard progress: %1.3f%%",
+            "bulk write #[%d] in [%3.4f]s | task %s/%s | pid %s | file %s shard progress: %1.3f%%",
             len(document_group),
             time.perf_counter() - t0,
             task_index,
             total_task_count,
+            worker_pid,
             input_file.name,
             progress * 100,
         )
