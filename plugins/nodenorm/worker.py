@@ -40,6 +40,8 @@ IDENTIFIER_WRITER_FAILED = None
 
 
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
+    os.environ["SQLITE_TMPDIR"] = "/data/annotator/sqlite_tmp"
+
     create_identifiers_table(data_folder)
 
     process_context = multiprocessing.get_context()
@@ -473,7 +475,7 @@ def create_identifiers_table(data_folder: Union[str, Path]) -> None:
     identifier_database = (
         Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
     )
-    identifier_connection = sqlite3.connect(str(identifier_database))
+    identifier_connection = _connect_identifier_database(identifier_database)
     cursor = identifier_connection.cursor()
     identifier_existence_check = "DROP TABLE IF EXISTS identifiers"
     cursor.execute(identifier_existence_check)
@@ -489,7 +491,7 @@ def create_identifiers_index(data_folder: Union[str, Path]) -> None:
     identifier_database = (
         Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
     )
-    identifier_connection = sqlite3.connect(str(identifier_database))
+    identifier_connection = _connect_identifier_database(identifier_database)
     cursor = identifier_connection.cursor()
 
     identifier_index = (
@@ -509,6 +511,13 @@ def create_mongo_identifiers_index(collection_name: str) -> None:
     collection.create_index("identifiers.i")
 
 
+def _connect_identifier_database(identifier_database: Union[str, Path]):
+    identifier_connection = sqlite3.connect(str(identifier_database))
+    identifier_connection.execute("PRAGMA journal_mode=WAL")
+    identifier_connection.execute("PRAGMA synchronous=NORMAL")
+    return identifier_connection
+
+
 def _write_identifier_batches(
     data_folder: Union[str, Path],
     identifier_queue,
@@ -518,11 +527,13 @@ def _write_identifier_batches(
     """
     Own the SQLite identifier connection and persist streamed worker batches.
     """
-    identifier_database = Path(data_folder).joinpath(IDENTIFIER_LOOKUP_DATABASE)
+    identifier_database = (
+        Path(data_folder).resolve().absolute().joinpath(IDENTIFIER_LOOKUP_DATABASE)
+    )
     identifier_connection = None
 
     try:
-        identifier_connection = sqlite3.connect(str(identifier_database))
+        identifier_connection = _connect_identifier_database(identifier_database)
         cursor = identifier_connection.cursor()
 
         while True:
