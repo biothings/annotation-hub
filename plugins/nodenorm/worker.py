@@ -33,10 +33,10 @@ from .static import (
 
 logger = config.logger
 NODENORM_WORKER_COUNT = 30
-NODENORM_IDENTIFIER_SHARD_COUNT = 32
-NODENORM_IDENTIFIER_BATCH_SIZE = 50_000
+NODENORM_IDENTIFIER_SHARD_COUNT = 8
+NODENORM_IDENTIFIER_BATCH_SIZE = 100_000
 NODENORM_IDENTIFIER_SHARD_QUEUE_SIZE = 60
-NODENORM_IDENTIFIER_COMMIT_BATCHES = 32
+NODENORM_IDENTIFIER_COMMIT_BATCHES = 8
 IDENTIFIER_WRITER_STOP = None
 IDENTIFIER_QUEUES = None
 IDENTIFIER_WRITER_FAILED = None
@@ -454,11 +454,10 @@ def _upload_buffer(
 ):
     try:
         t0 = time.perf_counter()
-        document_group = [pymongo.InsertOne(d) for d in buffer]
-        collection.bulk_write(document_group, ordered=False)
+        collection.insert_many(buffer, ordered=False)
         logger.debug(
-            "bulk write #[%d] in [%3.4f]s | file %s subset progress: %1.3f%%",
-            len(document_group),
+            "insert many #[%d] in [%3.4f]s | file %s subset progress: %1.3f%%",
+            len(buffer),
             time.perf_counter() - t0,
             input_file.name,
             progress * 100,
