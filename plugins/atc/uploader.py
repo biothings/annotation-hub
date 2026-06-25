@@ -59,8 +59,10 @@ class ATCUploader(biothings.hub.dataload.uploader.IgnoreDuplicatedSourceUploader
                 for row_mapping in dict_transformer:
                     document = {
                         "_id": row_mapping["atc_code"],
-                        "code": row_mapping["atc_code"],
-                        "name": row_mapping["atc_name"],
+                        "atc": {
+                            "code": row_mapping["atc_code"],
+                            "name": row_mapping["atc_name"],
+                        },
                     }
                     logger.debug("#%s %s", dict_transformer.line_num, row_mapping)
                     yield document
