@@ -11,14 +11,14 @@ cleanly into `annotator_extra`:
 {
   "_id": "PMID:12345678",
   "pubmed": {
-    "journal_name": "Example Journal",
-    "journal_abbrev": "Example J",
-    "article_title": "Example title",
-    "volume": "1",
-    "issue": "2",
-    "pub_year": "2026",
-    "pub_month": "6",
-    "pub_day": "30",
+    "journal": {
+      "name": "Example Journal",
+      "abbr": "Example J"
+    },
+    "title": "Example title",
+    "vol": "1",
+    "iss": "2",
+    "pub_date": "2026-06-30",
     "abstract": "Example abstract"
   }
 }
@@ -31,10 +31,17 @@ the upload with the shard and line number rather than producing a partial or
 silently altered document. The default storage also treats duplicate IDs as an
 error.
 
-Downloads and uploads are each capped at four concurrent shards. All content
-fields are retained in Elasticsearch `_source`, but they are intentionally not
-indexed: NodeAnnotator retrieves these documents by identifier, and indexing
-millions of titles and abstracts would add substantial storage overhead.
+The parser converts NLM month abbreviations to numbers and preserves the
+available publication-date precision: `YYYY-MM-DD` when all parts exist,
+`YYYY-MM` when the day is missing, and `YYYY` when only the year exists. It
+omits `pub_date` when the year is absent. Elasticsearch maps all three forms as
+a date; partial dates sort at the beginning of their represented period.
+
+Downloads and uploads are each capped at four concurrent shards. Abstracts are
+retained in Elasticsearch `_source` but are not indexed or sortable. The other
+metadata fields are indexed. `title` supports full-text matching and relevance
+scoring but is not sortable. `journal.name` uses its `.raw` keyword subfield
+when sorting; the keyword and date fields are directly sortable.
 Because this is a very large source, the uploader retains only one previous
 MongoDB source collection instead of the BioThings default of ten.
 

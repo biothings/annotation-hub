@@ -1,8 +1,10 @@
 """Streaming parser and validation for PubMed metadata NDJSON shards."""
 
+import calendar
 import gzip
 import json
 import re
+from datetime import date
 from pathlib import Path
 from typing import Iterator
 
@@ -19,8 +21,14 @@ EXPECTED_RECORD_FIELDS = (
     "pub_day",
     "abstract",
 )
-PUBMED_FIELDS = EXPECTED_RECORD_FIELDS[1:]
 PMID_PATTERN = re.compile(r"^PMID:[1-9][0-9]*$")
+YEAR_PATTERN = re.compile(r"^[0-9]{4}$")
+NUMERIC_DATE_PART_PATTERN = re.compile(r"^[0-9]{1,2}$")
+MONTH_NUMBERS = {
+    month_abbreviation.lower(): month_number
+    for month_number, month_abbreviation in enumerate(calendar.month_abbr)
+    if month_abbreviation
+}
 
 
 class PubMedMetadataValidationError(ValueError):
@@ -31,6 +39,64 @@ def _location(source: str, line_number: int | None) -> str:
     if line_number is None:
         return source
     return f"{source}:{line_number}"
+
+
+def _parse_month(value: str, location: str) -> int:
+    if NUMERIC_DATE_PART_PATTERN.fullmatch(value):
+        month = int(value)
+    else:
+        month = MONTH_NUMBERS.get(value.lower(), 0)
+
+    if not 1 <= month <= 12:
+        raise PubMedMetadataValidationError(
+            f"{location}: invalid publication month {value!r}"
+        )
+    return month
+
+
+def _build_pub_date(record: dict, location: str) -> str | None:
+    year_value = record["pub_year"]
+    month_value = record["pub_month"]
+    day_value = record["pub_day"]
+
+    if not year_value:
+        if month_value or day_value:
+            raise PubMedMetadataValidationError(
+                f"{location}: publication month/day requires a year"
+            )
+        return None
+
+    if YEAR_PATTERN.fullmatch(year_value) is None or int(year_value) == 0:
+        raise PubMedMetadataValidationError(
+            f"{location}: invalid publication year {year_value!r}"
+        )
+
+    if not month_value:
+        if day_value:
+            raise PubMedMetadataValidationError(
+                f"{location}: publication day requires a month"
+            )
+        return year_value
+
+    month = _parse_month(month_value, location)
+    year_month = f"{year_value}-{month:02d}"
+    if not day_value:
+        return year_month
+
+    if NUMERIC_DATE_PART_PATTERN.fullmatch(day_value) is None:
+        raise PubMedMetadataValidationError(
+            f"{location}: invalid publication day {day_value!r}"
+        )
+
+    day = int(day_value)
+    try:
+        publication_date = date(int(year_value), month, day)
+    except ValueError as error:
+        raise PubMedMetadataValidationError(
+            f"{location}: invalid publication date "
+            f"{year_value!r}/{month_value!r}/{day_value!r}"
+        ) from error
+    return publication_date.isoformat()
 
 
 def transform_pubmed_metadata_record(
@@ -73,9 +139,23 @@ def transform_pubmed_metadata_record(
             f"{location}: invalid PubMed identifier {pubmed_id!r}"
         )
 
+    pubmed = {
+        "journal": {
+            "name": record["journal_name"],
+            "abbr": record["journal_abbrev"],
+        },
+        "title": record["article_title"],
+        "vol": record["volume"],
+        "iss": record["issue"],
+        "abstract": record["abstract"],
+    }
+    pub_date = _build_pub_date(record, location)
+    if pub_date is not None:
+        pubmed["pub_date"] = pub_date
+
     return {
         "_id": pubmed_id,
-        "pubmed": {field: record[field] for field in PUBMED_FIELDS},
+        "pubmed": pubmed,
     }
 
 

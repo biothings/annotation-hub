@@ -45,15 +45,15 @@ def test_transform_namespaces_pubmed_metadata():
     assert document == {
         "_id": "PMID:12345678",
         "pubmed": {
-            "journal_name": "Journal of Examples",
-            "journal_abbrev": "J Ex",
-            "article_title": "A useful example",
-            "volume": "12",
-            "issue": "3",
-            "pub_year": "2026",
-            "pub_month": "6",
-            "pub_day": "30",
+            "journal": {
+                "name": "Journal of Examples",
+                "abbr": "J Ex",
+            },
+            "title": "A useful example",
+            "vol": "12",
+            "iss": "3",
             "abstract": "An abstract with Unicode: β.",
+            "pub_date": "2026-06-30",
         },
     }
 
@@ -90,6 +90,61 @@ def test_streams_gzip_ndjson(tmp_path):
 def test_rejects_invalid_records(record, message):
     with pytest.raises(parser.PubMedMetadataValidationError, match=message):
         parser.transform_pubmed_metadata_record(record)
+
+
+@pytest.mark.parametrize(
+    ("date_parts", "expected_date"),
+    [
+        ({"pub_year": "2026", "pub_month": "Jun", "pub_day": ""}, "2026-06"),
+        ({"pub_year": "2026", "pub_month": "", "pub_day": ""}, "2026"),
+        ({"pub_year": "2026", "pub_month": "6", "pub_day": "3"}, "2026-06-03"),
+        ({"pub_year": "2024", "pub_month": "feb", "pub_day": "29"}, "2024-02-29"),
+    ],
+)
+def test_builds_dates_at_available_precision(date_parts, expected_date):
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(**date_parts)
+    )
+
+    assert document["pubmed"]["pub_date"] == expected_date
+
+
+def test_omits_date_when_all_components_are_missing():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(pub_year="", pub_month="", pub_day="")
+    )
+
+    assert "pub_date" not in document["pubmed"]
+
+
+@pytest.mark.parametrize(
+    ("date_parts", "message"),
+    [
+        (
+            {"pub_year": "", "pub_month": "Jun", "pub_day": ""},
+            "publication month/day requires a year",
+        ),
+        (
+            {"pub_year": "2026", "pub_month": "", "pub_day": "15"},
+            "publication day requires a month",
+        ),
+        (
+            {"pub_year": "26", "pub_month": "", "pub_day": ""},
+            "invalid publication year",
+        ),
+        (
+            {"pub_year": "2026", "pub_month": "Smarch", "pub_day": ""},
+            "invalid publication month",
+        ),
+        (
+            {"pub_year": "2026", "pub_month": "Feb", "pub_day": "30"},
+            "invalid publication date",
+        ),
+    ],
+)
+def test_rejects_invalid_date_components(date_parts, message):
+    with pytest.raises(parser.PubMedMetadataValidationError, match=message):
+        parser.transform_pubmed_metadata_record(upstream_record(**date_parts))
 
 
 def test_reports_shard_and_line_for_invalid_json(tmp_path):

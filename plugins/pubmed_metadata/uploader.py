@@ -4,6 +4,7 @@ from pathlib import Path
 
 from biothings.hub.dataload.uploader import ParallelizedSourceUploader
 
+from .mapping import get_pubmed_metadata_mapping
 from .parser import iter_pubmed_metadata_documents
 from .static import (
     BASE_URL,
@@ -11,12 +12,6 @@ from .static import (
     PUBMED2DB_URL,
     PUBMED_METADATA_FILES,
 )
-
-
-def _stored_keyword() -> dict:
-    """Map a value into ``_source`` without building a search index for it."""
-
-    return {"type": "keyword", "index": False, "doc_values": False}
 
 
 class PubMedMetadataUploader(ParallelizedSourceUploader):
@@ -53,18 +48,4 @@ class PubMedMetadataUploader(ParallelizedSourceUploader):
 
     @classmethod
     def get_mapping(cls) -> dict:
-        return {
-            "pubmed": {
-                "properties": {
-                    "journal_name": _stored_keyword(),
-                    "journal_abbrev": _stored_keyword(),
-                    "article_title": {"type": "text", "index": False},
-                    "volume": _stored_keyword(),
-                    "issue": _stored_keyword(),
-                    "pub_year": _stored_keyword(),
-                    "pub_month": _stored_keyword(),
-                    "pub_day": _stored_keyword(),
-                    "abstract": {"type": "text", "index": False},
-                }
-            }
-        }
+        return get_pubmed_metadata_mapping()
