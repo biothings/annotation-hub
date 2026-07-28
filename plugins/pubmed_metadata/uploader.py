@@ -38,7 +38,8 @@ class PubMedMetadataUploader(ParallelizedSourceUploader):
         missing_paths = [path.name for path in shard_paths if not path.is_file()]
         if missing_paths:
             raise FileNotFoundError(
-                "PubMed metadata upload requires all 16 shards; missing: "
+                "PubMed metadata upload requires all "
+                f"{len(PUBMED_METADATA_FILES)} shards; missing: "
                 + ", ".join(missing_paths)
             )
         return [(str(path),) for path in shard_paths]
