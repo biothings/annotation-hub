@@ -42,12 +42,26 @@ IDENTIFIER_QUEUES = None
 IDENTIFIER_WRITER_FAILED = None
 
 
+def _configure_sqlite_tmpdir() -> Path:
+    configured_tmpdir = os.environ.get("SQLITE_TMPDIR", "").strip()
+    sqlite_tmpdir = (
+        Path(configured_tmpdir).expanduser()
+        if configured_tmpdir
+        else Path(config.DATA_ARCHIVE_ROOT).joinpath("sqlite_tmp")
+    ).resolve()
+    sqlite_tmpdir.mkdir(parents=True, exist_ok=True)
+    if not os.access(sqlite_tmpdir, os.W_OK | os.X_OK):
+        raise OSError(f"SQLite temp directory is not writable: {sqlite_tmpdir}")
+    os.environ["SQLITE_TMPDIR"] = str(sqlite_tmpdir)
+    return sqlite_tmpdir
+
+
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
-    os.environ["SQLITE_TMPDIR"] = "/data/annotator/sqlite_tmp"
+    _configure_sqlite_tmpdir()
 
     create_identifiers_table(data_folder)
 
-    process_context = multiprocessing.get_context()
+    process_context = multiprocessing.get_context("spawn")
     identifier_queues = tuple(
         process_context.Queue(maxsize=NODENORM_IDENTIFIER_SHARD_QUEUE_SIZE)
         for _ in range(NODENORM_IDENTIFIER_SHARD_COUNT)
@@ -78,6 +92,7 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
 
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=NODENORM_WORKER_COUNT,
+            mp_context=process_context,
             initializer=_configure_identifier_writer,
             initargs=(identifier_queues, identifier_writer_failed),
         ) as executor:
