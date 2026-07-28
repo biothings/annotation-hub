@@ -35,4 +35,4 @@ plugins
 * `~/plugins/atc`
 * `~/plugins/multiomics_clinicaltrials_kp`
 * `~/plugins/multiomics_drug_approvals_kp`
-* `~/plugins/pubmed_metadata`
+* `~/plugins/pubmed_metadata` (standalone PubMed index)

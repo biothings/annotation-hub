@@ -4,8 +4,8 @@ This NodeAnnotator source ingests the RENCI `pubmed2db` snapshot published at
 <https://stars.renci.org/var/babel_outputs/pubmed2db/2026jun30/>. The pinned
 release contains 16 gzip-compressed NDJSON shards (about 16.85 GB compressed).
 
-Each upstream record is stored under a source-specific key so it can be merged
-cleanly into `annotator_extra`:
+Each upstream record is stored under a `pubmed` source key in a standalone
+PubMed index:
 
 ```json
 {
@@ -45,11 +45,15 @@ when sorting; the keyword and date fields are directly sortable.
 Because this is a very large source, the uploader retains only one previous
 MongoDB source collection instead of the BioThings default of ten.
 
-After the first successful upload, add `pubmed_metadata` to the source list of
-the `annotator_extra` build configuration in the Hub database. Build
-configuration is deployment state and is not stored in this repository. Serving
-the merged records also requires the NodeAnnotator runtime to route `PMID:`
-identifiers to `annotator_extra`.
+Build `pubmed_metadata` by itself into a versioned `pubmed_*` Elasticsearch
+index. After validating the index, point the stable `annotator-pubmed` alias to
+it. NodeAnnotator routes `PMID:` identifiers to that alias.
+
+For subsequent releases, move the alias from the previous index to the newly
+validated index in one atomic Elasticsearch alias update. Keep the previous
+index temporarily for rollback and remove it separately after validation.
+Build configuration and alias state are deployment state and are not stored in
+this repository.
 
 This is a full snapshot rather than an incremental feed. DOI and PMC identifiers
 are not present in this export. To adopt a newer snapshot, update `RELEASE` in
