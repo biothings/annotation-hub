@@ -49,11 +49,17 @@ class FakeClient:
         return response
 
 
-@pytest.fixture
-def nameres_dumper_module(monkeypatch, tmp_path):
+@pytest.fixture(
+    params=[
+        pytest.param(("nameres", "NameResDumper"), id="nameres"),
+        pytest.param(("nodenorm", "NodeNormDumper"), id="nodenorm"),
+    ]
+)
+def range_dumper_module(request, monkeypatch, tmp_path):
+    plugin_name, dumper_class_name = request.param
     config = types.SimpleNamespace(
         DATA_ARCHIVE_ROOT=str(tmp_path),
-        logger=logging.getLogger("test_nameres_dumper"),
+        logger=logging.getLogger(f"test_{plugin_name}_dumper"),
     )
     biothings_module = types.ModuleType("biothings")
     biothings_module.config = config
@@ -91,12 +97,14 @@ def nameres_dumper_module(monkeypatch, tmp_path):
     )
     monkeypatch.setitem(sys.modules, "biothings.utils.manager", manager_dependency)
 
-    package_name = f"_test_nameres_{id(tmp_path)}"
+    package_name = f"_test_{plugin_name}_{id(tmp_path)}"
     package = types.ModuleType(package_name)
-    package.__path__ = [str(Path(__file__).parents[1] / "plugins" / "nameres")]
+    package.__path__ = [
+        str(Path(__file__).parents[1] / "plugins" / plugin_name)
+    ]
     monkeypatch.setitem(sys.modules, package_name, package)
 
-    module_dir = Path(__file__).parents[1] / "plugins" / "nameres"
+    module_dir = Path(__file__).parents[1] / "plugins" / plugin_name
     static_spec = importlib.util.spec_from_file_location(
         f"{package_name}.static", module_dir / "static.py"
     )
@@ -112,12 +120,15 @@ def nameres_dumper_module(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, f"{package_name}.dumper", dumper_module)
     assert dumper_spec.loader is not None
     dumper_spec.loader.exec_module(dumper_module)
+    dumper_module._test_dumper_class = getattr(
+        dumper_module, dumper_class_name
+    )
     return dumper_module
 
 
 def make_dumper(dumper_module):
-    dumper = object.__new__(dumper_module.NameResDumper)
-    dumper.logger = logging.getLogger("test_nameres_dumper.instance")
+    dumper = object.__new__(dumper_module._test_dumper_class)
+    dumper.logger = logging.getLogger("test_range_download_dumper.instance")
     return dumper
 
 
@@ -129,21 +140,21 @@ def make_dumper(dumper_module):
     ],
 )
 def test_range_chunks_cover_file_without_extra_chunk(
-    nameres_dumper_module, file_size, partitions, expected
+    range_dumper_module, file_size, partitions, expected
 ):
-    dumper = make_dumper(nameres_dumper_module)
+    dumper = make_dumper(range_dumper_module)
     dumper.get_file_size = lambda url: file_size
 
     assert dumper.get_range_chunks("https://example.test/data", partitions) == expected
 
 
-def test_download_range_retries_retryable_status(nameres_dumper_module, tmp_path):
+def test_download_range_retries_retryable_status(range_dumper_module, tmp_path):
     retry_response = FakeResponse(status_code=503, reason="Service Unavailable")
     success_response = FakeResponse(
         headers={"Content-Range": "bytes 0-3/4"},
         chunks=(b"ab", b"cd"),
     )
-    dumper = make_dumper(nameres_dumper_module)
+    dumper = make_dumper(range_dumper_module)
     dumper.client = FakeClient([retry_response, success_response])
     dumper.RANGE_DOWNLOAD_MAX_ATTEMPTS = 2
     dumper.RANGE_DOWNLOAD_BACKOFF_SECONDS = 0
@@ -164,7 +175,7 @@ def test_download_range_retries_retryable_status(nameres_dumper_module, tmp_path
 
 
 def test_download_range_rejects_incomplete_response(
-    nameres_dumper_module, tmp_path
+    range_dumper_module, tmp_path
 ):
     responses = [
         FakeResponse(
@@ -173,14 +184,14 @@ def test_download_range_rejects_incomplete_response(
         )
         for _ in range(2)
     ]
-    dumper = make_dumper(nameres_dumper_module)
+    dumper = make_dumper(range_dumper_module)
     dumper.client = FakeClient(responses)
     dumper.RANGE_DOWNLOAD_MAX_ATTEMPTS = 2
     dumper.RANGE_DOWNLOAD_BACKOFF_SECONDS = 0
     output_path = tmp_path / "chunk.part0"
 
     with pytest.raises(
-        nameres_dumper_module.DumperException,
+        range_dumper_module.DumperException,
         match="after 2 attempts.*expected 4 bytes, received 3",
     ):
         dumper.download_range(
@@ -192,9 +203,9 @@ def test_download_range_rejects_incomplete_response(
 
 
 def test_worker_failure_is_propagated_and_target_is_preserved(
-    nameres_dumper_module, tmp_path
+    range_dumper_module, tmp_path
 ):
-    dumper = make_dumper(nameres_dumper_module)
+    dumper = make_dumper(range_dumper_module)
     dumper.prepare_local_folders = lambda path: Path(path).parent.mkdir(
         parents=True, exist_ok=True
     )
@@ -203,7 +214,7 @@ def test_worker_failure_is_propagated_and_target_is_preserved(
     def download_range(url, start, end, output):
         del url, end
         if start == 2:
-            raise nameres_dumper_module.DumperException("worker failed")
+            raise range_dumper_module.DumperException("worker failed")
         Path(output).write_bytes(b"ab")
 
     dumper.download_range = download_range
@@ -211,7 +222,7 @@ def test_worker_failure_is_propagated_and_target_is_preserved(
     output_path.write_bytes(b"previous")
 
     with pytest.raises(
-        nameres_dumper_module.DumperException, match="worker failed"
+        range_dumper_module.DumperException, match="worker failed"
     ):
         dumper._download_in_ranges(
             "https://example.test/data",
@@ -224,8 +235,8 @@ def test_worker_failure_is_propagated_and_target_is_preserved(
     assert list(tmp_path.glob("combined.part*")) == []
 
 
-def test_range_worker_concurrency_is_bounded(nameres_dumper_module, tmp_path):
-    dumper = make_dumper(nameres_dumper_module)
+def test_range_worker_concurrency_is_bounded(range_dumper_module, tmp_path):
+    dumper = make_dumper(range_dumper_module)
     dumper.prepare_local_folders = lambda path: Path(path).parent.mkdir(
         parents=True, exist_ok=True
     )
@@ -265,8 +276,8 @@ def test_range_worker_concurrency_is_bounded(nameres_dumper_module, tmp_path):
     assert list(tmp_path.glob("combined.part*")) == []
 
 
-def test_large_file_concurrency_is_bounded(nameres_dumper_module):
-    dumper = make_dumper(nameres_dumper_module)
+def test_large_file_concurrency_is_bounded(range_dumper_module):
+    dumper = make_dumper(range_dumper_module)
     dumper.MAX_PARALLEL_LARGE_FILES = 2
     dumper.to_dump_large = [
         {
