@@ -176,9 +176,6 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         Leverages multiple threads to download the remote file in multiple chunks
         concurrently and then combines them at the end
         """
-        if headers is None:
-            headers = {}
-
         logger.info(
             "Downloading (normal) file %s -> %s | Partitions %s",
             remoteurl,
@@ -190,6 +187,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
             localfile,
             10,
             max_workers=self.NORMAL_FILE_RANGE_WORKERS,
+            headers=headers,
         )
 
     def _download_in_ranges(
@@ -198,10 +196,16 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         localfile: Union[str, Path],
         num_partitions: int,
         max_workers: int,
+        headers: dict = None,
     ) -> None:
         self.prepare_local_folders(localfile)
         local_path = Path(localfile)
-        chunks = self.get_range_chunks(remoteurl, num_partitions)
+        if headers is None:
+            chunks = self.get_range_chunks(remoteurl, num_partitions)
+        else:
+            chunks = self.get_range_chunks(
+                remoteurl, num_partitions, headers=headers
+            )
         chunk_paths = [
             Path(f"{local_path}.part{index}") for index in range(len(chunks))
         ]
@@ -213,12 +217,17 @@ class NodeNormDumper(LastModifiedHTTPDumper):
                 max_workers=workers
             ) as executor:
                 for chunk_path, (chunk_start, chunk_end) in zip(chunk_paths, chunks):
+                    download_arguments = {
+                        "url": remoteurl,
+                        "start": chunk_start,
+                        "end": chunk_end,
+                        "output": str(chunk_path),
+                    }
+                    if headers is not None:
+                        download_arguments["headers"] = headers
                     future = executor.submit(
                         self.download_range,
-                        url=remoteurl,
-                        start=chunk_start,
-                        end=chunk_end,
-                        output=str(chunk_path),
+                        **download_arguments,
                     )
                     future_to_chunk[future] = chunk_path
 
@@ -249,21 +258,41 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         self._cleanup_chunk_files(chunk_paths)
         logger.info("Combined all chunks -> %s", local_path)
 
-    def get_file_size(self, url: str) -> int:
+    def get_file_size(self, url: str, headers: dict = None) -> int:
         """
         Sends a HEAD request to the specified URL and extracts
         the `Content-Length` header to determine the file size
 
         Used for determining how to chunk the file download
         """
-        response = self.client.head(url, timeout=self.RANGE_REQUEST_TIMEOUT)
+        request_arguments = {"timeout": self.RANGE_REQUEST_TIMEOUT}
+        if headers is not None:
+            request_arguments["headers"] = {
+                key: value
+                for key, value in headers.items()
+                if key.lower() != "range"
+            }
+        try:
+            response = self.client.head(url, **request_arguments)
+        except requests_exceptions.RequestException as exc:
+            raise DumperException(
+                f"Unable to determine size of '{url}': {exc}"
+            ) from exc
+
         try:
             if response.status_code >= 400:
                 raise DumperException(
                     f"Unable to determine size of '{url}' "
                     f"(status: {response.status_code}, reason: {response.reason})"
                 )
-            size = int(response.headers["Content-Length"])
+            content_length = response.headers.get("Content-Length")
+            try:
+                size = int(content_length)
+            except (TypeError, ValueError) as exc:
+                raise DumperException(
+                    f"Unable to determine size of '{url}': "
+                    f"invalid Content-Length {content_length!r}"
+                ) from exc
             if size <= 0:
                 raise DumperException(
                     f"Unable to determine size of '{url}': invalid Content-Length"
@@ -273,7 +302,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
             response.close()
 
     def get_range_chunks(
-        self, url: str, num_partitions: int = 10
+        self, url: str, num_partitions: int = 10, headers: dict = None
     ) -> list[tuple[int, int]]:
         """
         Partitions a file into distinct chunks for consuming each chunk within
@@ -282,16 +311,31 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         if num_partitions <= 0:
             raise ValueError("num_partitions must be greater than zero")
 
-        file_size = self.get_file_size(url)
+        if headers is None:
+            file_size = self.get_file_size(url)
+        else:
+            file_size = self.get_file_size(url, headers=headers)
         chunk_size = math.ceil(file_size / num_partitions)
         return [
             (chunk_start, min(chunk_start + chunk_size - 1, file_size - 1))
             for chunk_start in range(0, file_size, chunk_size)
         ]
 
-    def download_range(self, url: str, start: int, end: int, output: str) -> None:
+    def download_range(
+        self,
+        url: str,
+        start: int,
+        end: int,
+        output: str,
+        headers: dict = None,
+    ) -> None:
         self.logger.debug("Downloading Filepart '%s' as '%s'", url, output)
-        headers = {"Range": f"bytes={start}-{end}"}
+        request_headers = {
+            key: value
+            for key, value in (headers or {}).items()
+            if key.lower() != "range"
+        }
+        request_headers["Range"] = f"bytes={start}-{end}"
         expected_content_range = f"bytes {start}-{end}/"
         expected_size = end - start + 1
         output_path = Path(output)
@@ -305,7 +349,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
             try:
                 response = self.client.get(
                     url,
-                    headers=headers,
+                    headers=request_headers,
                     stream=True,
                     timeout=self.RANGE_REQUEST_TIMEOUT,
                 )

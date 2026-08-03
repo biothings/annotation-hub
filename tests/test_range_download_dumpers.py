@@ -38,11 +38,20 @@ class FakeClient:
     def __init__(self, responses):
         self.responses = deque(responses)
         self.get_calls = []
+        self.head_calls = []
         self.lock = threading.Lock()
 
     def get(self, url, **kwargs):
         with self.lock:
             self.get_calls.append((url, kwargs))
+            response = self.responses.popleft()
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def head(self, url, **kwargs):
+        with self.lock:
+            self.head_calls.append((url, kwargs))
             response = self.responses.popleft()
         if isinstance(response, Exception):
             raise response
@@ -146,6 +155,92 @@ def test_range_chunks_cover_file_without_extra_chunk(
     dumper.get_file_size = lambda url: file_size
 
     assert dumper.get_range_chunks("https://example.test/data", partitions) == expected
+
+
+@pytest.mark.parametrize(
+    "content_length",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("not-a-number", id="invalid"),
+        pytest.param("0", id="nonpositive"),
+    ],
+)
+def test_get_file_size_rejects_invalid_content_length(
+    range_dumper_module, content_length
+):
+    headers = (
+        {} if content_length is None else {"Content-Length": content_length}
+    )
+    response = FakeResponse(status_code=200, headers=headers)
+    dumper = make_dumper(range_dumper_module)
+    dumper.client = FakeClient([response])
+
+    with pytest.raises(
+        range_dumper_module.DumperException, match="invalid Content-Length"
+    ):
+        dumper.get_file_size("https://example.test/data")
+
+    assert response.closed is True
+    assert (
+        dumper.client.head_calls[0][1]["timeout"]
+        == dumper.RANGE_REQUEST_TIMEOUT
+    )
+
+
+def test_get_file_size_wraps_request_errors(range_dumper_module):
+    request_error = range_dumper_module.requests_exceptions.Timeout(
+        "request timed out"
+    )
+    dumper = make_dumper(range_dumper_module)
+    dumper.client = FakeClient([request_error])
+
+    with pytest.raises(
+        range_dumper_module.DumperException,
+        match="Unable to determine size.*request timed out",
+    ):
+        dumper.get_file_size("https://example.test/data")
+
+    assert (
+        dumper.client.head_calls[0][1]["timeout"]
+        == dumper.RANGE_REQUEST_TIMEOUT
+    )
+
+
+def test_custom_headers_are_applied_to_size_and_range_requests(
+    range_dumper_module, tmp_path
+):
+    size_response = FakeResponse(
+        status_code=200, headers={"Content-Length": "1"}
+    )
+    range_response = FakeResponse(
+        headers={"Content-Range": "bytes 0-0/1"},
+        chunks=(b"a",),
+    )
+    dumper = make_dumper(range_dumper_module)
+    dumper.client = FakeClient([size_response, range_response])
+    dumper.prepare_local_folders = lambda path: Path(path).parent.mkdir(
+        parents=True, exist_ok=True
+    )
+    output_path = tmp_path / "combined"
+    custom_headers = {
+        "Authorization": "Bearer example-token",
+        "range": "bytes=99-100",
+    }
+
+    dumper.download(
+        "https://example.test/data",
+        output_path,
+        headers=custom_headers,
+    )
+
+    assert output_path.read_bytes() == b"a"
+    assert dumper.client.head_calls[0][1]["headers"] == {
+        "Authorization": "Bearer example-token"
+    }
+    request_headers = dumper.client.get_calls[0][1]["headers"]
+    assert request_headers["Authorization"] == "Bearer example-token"
+    assert request_headers["Range"] == "bytes=0-0"
+    assert custom_headers["range"] == "bytes=99-100"
 
 
 def test_download_range_retries_retryable_status(range_dumper_module, tmp_path):
