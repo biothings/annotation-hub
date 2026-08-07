@@ -83,12 +83,13 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
             _identifier_database_paths(data_folder)
         )
     ]
-    identifier_writers_started = False
+    started_identifier_writers = []
+    upload_error = None
 
     try:
         for identifier_writer in identifier_writers:
             identifier_writer.start()
-        identifier_writers_started = True
+            started_identifier_writers.append(identifier_writer)
 
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=NODENORM_WORKER_COUNT,
@@ -97,25 +98,21 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
             initargs=(identifier_queues, identifier_writer_failed),
         ) as executor:
             process_futures = set()
-            for index, task in enumerate(
-                _build_offset_tasks(data_folder, collection_name)
-            ):
-                future = executor.submit(subset_upload_worker, **task)
-                process_futures.add(future)
+            try:
+                for index, task in enumerate(
+                    _build_offset_tasks(data_folder, collection_name)
+                ):
+                    future = executor.submit(subset_upload_worker, **task)
+                    process_futures.add(future)
 
-            total_document_count = 0
-            for index, future in enumerate(
-                concurrent.futures.as_completed(process_futures)
-            ):
-                # Completed futures retain their result; drop our reference
-                # before waiting on the next upload task.
-                process_futures.discard(future)
-                try:
+                total_document_count = 0
+                for index, future in enumerate(
+                    concurrent.futures.as_completed(process_futures)
+                ):
+                    # Completed futures retain their result; drop our reference
+                    # before waiting on the next upload task.
+                    process_futures.discard(future)
                     identifier_count = future.result()
-                except Exception as gen_exc:
-                    logger.exception(gen_exc)
-                    raise gen_exc
-                else:
                     total_document_count += identifier_count
                     logger.debug(
                         "Task %s completed | Update %s identifiers | Total identifiers %s",
@@ -125,19 +122,28 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
                     )
                     del identifier_count
                     del future
+            except Exception as upload_exception:
+                logger.exception(upload_exception)
+                for pending_future in process_futures:
+                    pending_future.cancel()
+                raise
+    except Exception as upload_exception:
+        upload_error = upload_exception
     finally:
-        if identifier_writers_started and not identifier_writer_failed.is_set():
-            for identifier_queue in identifier_queues:
-                identifier_queue.put(IDENTIFIER_WRITER_STOP)
-        if identifier_writers_started:
-            for identifier_writer in identifier_writers:
-                identifier_writer.join()
+        for identifier_queue in identifier_queues[: len(started_identifier_writers)]:
+            identifier_queue.put(IDENTIFIER_WRITER_STOP)
+        for identifier_writer in started_identifier_writers:
+            identifier_writer.join()
         for identifier_queue in identifier_queues:
             identifier_queue.close()
             identifier_queue.join_thread()
 
     if identifier_writer_errors:
+        if upload_error is not None:
+            raise identifier_writer_errors[0] from upload_error
         raise identifier_writer_errors[0]
+    if upload_error is not None:
+        raise upload_error
 
     create_mongo_identifiers_index(collection_name)
     create_identifiers_index(data_folder)
@@ -590,22 +596,23 @@ def _write_identifier_batches(
     Own one SQLite identifier shard connection and persist streamed worker batches.
     """
     identifier_connection = None
+    stop_received = False
 
     try:
         identifier_connection = _connect_identifier_database(identifier_database)
         cursor = identifier_connection.cursor()
 
         while True:
-            if identifier_writer_failed.is_set():
-                break
-
             try:
                 identifier_batch = identifier_queue.get(timeout=5)
             except queue.Empty:
                 continue
 
             if identifier_batch is IDENTIFIER_WRITER_STOP:
+                stop_received = True
                 break
+            if identifier_writer_failed.is_set():
+                continue
 
             update_identifier_collection(cursor, identifier_batch)
             batch_count = 1
@@ -619,6 +626,7 @@ def _write_identifier_batches(
                     break
 
                 if identifier_batch is IDENTIFIER_WRITER_STOP:
+                    stop_received = True
                     break
 
                 update_identifier_collection(cursor, identifier_batch)
@@ -626,18 +634,33 @@ def _write_identifier_batches(
 
             identifier_connection.commit()
 
-            if (
-                identifier_batch is IDENTIFIER_WRITER_STOP
-                or identifier_writer_failed.is_set()
-            ):
+            if stop_received:
                 break
     except Exception as write_exception:
-        identifier_writer_failed.set()
         identifier_writer_errors.append(write_exception)
+        identifier_writer_failed.set()
         logger.exception(write_exception)
+        if not stop_received:
+            _drain_identifier_queue(identifier_queue)
     finally:
         if identifier_connection is not None:
-            identifier_connection.close()
+            try:
+                identifier_connection.close()
+            except Exception as close_exception:
+                identifier_writer_errors.append(close_exception)
+                identifier_writer_failed.set()
+                logger.exception(close_exception)
+
+
+def _drain_identifier_queue(identifier_queue):
+    """Discard queued batches until shutdown so producer feeder threads can exit."""
+    while True:
+        try:
+            identifier_batch = identifier_queue.get(timeout=5)
+        except queue.Empty:
+            continue
+        if identifier_batch is IDENTIFIER_WRITER_STOP:
+            return
 
 
 def update_identifier_collection(cursor: sqlite3.Cursor, identifiers: list[str]):
@@ -665,23 +688,20 @@ def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: st
         max_workers=NODENORM_WORKER_COUNT
     ) as executor:
         process_futures = []
-        duplicate_curies = _iter_duplicate_curies(data_folder)
-        for index, curie_batch in enumerate(iter_n(duplicate_curies, 1000)):
-            arguments = {
-                "task_id": index,
-                "curies": curie_batch,
-                "collection_name": collection_name,
-            }
-            future = executor.submit(_curie_duplication_batch_handler, **arguments)
-            process_futures.append(future)
+        try:
+            duplicate_curies = _iter_duplicate_curies(data_folder)
+            for index, curie_batch in enumerate(iter_n(duplicate_curies, 1000)):
+                arguments = {
+                    "task_id": index,
+                    "curies": curie_batch,
+                    "collection_name": collection_name,
+                }
+                future = executor.submit(_curie_duplication_batch_handler, **arguments)
+                process_futures.append(future)
 
-        total_correction_count = 0
-        for future in concurrent.futures.as_completed(process_futures):
-            try:
+            total_correction_count = 0
+            for future in concurrent.futures.as_completed(process_futures):
                 task_id, num_corrections = future.result()
-            except Exception as gen_exc:
-                logger.exception(gen_exc)
-            else:
                 total_correction_count += num_corrections
                 logger.debug(
                     "Task %s completed | Corrected %s documents | Total corrections %s",
@@ -689,6 +709,11 @@ def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: st
                     num_corrections,
                     total_correction_count,
                 )
+        except Exception:
+            for pending_future in process_futures:
+                pending_future.cancel()
+            logger.exception("CURIE duplicate cleanup failed")
+            raise
 
 
 def _iter_duplicate_curies(data_folder: Union[str, Path]):

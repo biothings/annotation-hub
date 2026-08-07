@@ -22,11 +22,16 @@ ordered ahead of the plugin imports.
 """
 
 import ast
+import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
-PLUGIN_ROOT = Path(__file__).parents[1] / "plugins"
+REPOSITORY_ROOT = Path(__file__).parents[1]
+PLUGIN_ROOT = REPOSITORY_ROOT / "plugins"
 BOOTSTRAP_MODULE = "biothings.hub"
 
 
@@ -60,9 +65,7 @@ def test_plugin_package_bootstraps_biothings_config(plugin_name):
 
     relative_imports = [name for name in imported if name.startswith(".")]
     assert relative_imports, f"expected {package_init} to import plugin modules"
-    assert imported.index(BOOTSTRAP_MODULE) < imported.index(
-        relative_imports[0]
-    ), (
+    assert imported.index(BOOTSTRAP_MODULE) < imported.index(relative_imports[0]), (
         f"{package_init} must import {BOOTSTRAP_MODULE} before its own modules, "
         "which read 'biothings.config' at import time"
     )
@@ -97,4 +100,112 @@ def test_plugin_modules_still_read_config_at_import_time(plugin_name):
     assert importers, (
         f"no {plugin_name} module reads 'biothings.config' at import time any "
         "more; re-evaluate whether the bootstrap import is still required"
+    )
+
+
+def test_spawned_nodenorm_worker_bootstraps_config_and_hub_db(tmp_path):
+    config_module_name = "spawn_test_hub_config"
+    sqlite_folder = tmp_path / "hubdb"
+    archive_folder = tmp_path / "archive"
+    log_folder = tmp_path / "logs"
+    (tmp_path / f"{config_module_name}.py").write_text(
+        textwrap.dedent(f"""
+            import logging
+
+            HUB_DB_BACKEND = {{
+                "module": "biothings.utils.sqlite3",
+                "sqlite_db_folder": {str(sqlite_folder)!r},
+            }}
+            DATA_HUB_DB_DATABASE = "spawn_hub"
+            DATA_SRC_DATABASE = "spawn_src"
+            DATA_ARCHIVE_ROOT = {str(archive_folder)!r}
+            LOG_FOLDER = {str(log_folder)!r}
+            logger = logging.getLogger("spawn-test-hub")
+
+
+            def source_db_name():
+                from biothings.utils.hub_db import get_src_db
+
+                return get_src_db().name
+            """),
+        encoding="utf-8",
+    )
+
+    driver = tmp_path / "spawn_driver.py"
+    driver.write_text(
+        textwrap.dedent("""
+            import concurrent.futures
+            import importlib
+            import multiprocessing
+            import os
+            from pathlib import Path
+
+
+            def allow_restricted_semaphore_query():
+                original_sysconf = getattr(os, "sysconf", None)
+                if original_sysconf is None:
+                    return
+                try:
+                    original_sysconf("SC_SEM_NSEMS_MAX")
+                except PermissionError:
+                    def sysconf(name):
+                        if name == "SC_SEM_NSEMS_MAX":
+                            return 256
+                        return original_sysconf(name)
+
+                    os.sysconf = sysconf
+
+
+            def main():
+                import biothings.hub  # noqa: F401
+                from plugins.nodenorm.worker import _configure_sqlite_tmpdir
+
+                test_config = importlib.import_module(os.environ["HUB_CONFIG"])
+                allow_restricted_semaphore_query()
+                context = multiprocessing.get_context("spawn")
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=1,
+                    mp_context=context,
+                ) as executor:
+                    configured_tmpdir = executor.submit(
+                        _configure_sqlite_tmpdir
+                    ).result(timeout=20)
+                    source_db_name = executor.submit(
+                        test_config.source_db_name
+                    ).result(timeout=20)
+
+                expected_tmpdir = (
+                    Path(test_config.DATA_ARCHIVE_ROOT) / "sqlite_tmp"
+                ).resolve()
+                assert configured_tmpdir == expected_tmpdir
+                assert source_db_name == test_config.DATA_SRC_DATABASE
+
+
+            if __name__ == "__main__":
+                main()
+            """),
+        encoding="utf-8",
+    )
+
+    environment = os.environ.copy()
+    python_path = [str(tmp_path), str(REPOSITORY_ROOT)]
+    if environment.get("PYTHONPATH"):
+        python_path.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(python_path)
+    environment["HUB_CONFIG"] = config_module_name
+    environment.pop("SQLITE_TMPDIR", None)
+
+    result = subprocess.run(
+        [sys.executable, str(driver)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+
+    assert result.returncode == 0, (
+        "spawned NodeNorm worker failed to bootstrap Hub configuration:\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
