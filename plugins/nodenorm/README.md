@@ -1,6 +1,6 @@
 ## pending-nodenorm
 
-Hosted API of the nodenorm data provided by [RENCI](https://stars.renci.org/var/babel_outputs/2025mar31/compendia/)
+Hosted API of the NodeNorm data provided by [RENCI](https://stars.renci.org/var/babel_outputs/). The production dump follows the release named by `latest/VERSION.txt`.
 
 File list (with smaller chunk files removed) as of September 2nd 2025
 

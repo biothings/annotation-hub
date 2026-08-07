@@ -9,19 +9,20 @@ import time
 from functools import partial
 from pathlib import Path
 from typing import override, Union
-from urllib.parse import urlparse
 
 from biothings import config
 from biothings.hub.dataload.dumper import DumperException, LastModifiedHTTPDumper
 from biothings.utils.manager import JobManager
 from requests import exceptions as requests_exceptions
 
+from .release import NodeNormReleaseError, parse_version_marker, validate_release
 from .static import (
-    BASE_URL,
+    BABEL_OUTPUT_ROOT,
     CONFLATION_LOOKUP_DATABASE,
     NODENORM_BIG_FILE_COLLECTION,
     NODENORM_CONFLATION_COLLECTION,
     NODENORM_FILE_COLLECTION,
+    VERSION_URL,
 )
 
 logger = config.logger
@@ -31,22 +32,22 @@ class _RetryableRangeDownloadError(Exception):
     pass
 
 
-file_collections = {
-    "compendia": NODENORM_FILE_COLLECTION,
-    "compendia-large": NODENORM_BIG_FILE_COLLECTION,
-    "conflation": NODENORM_CONFLATION_COLLECTION,
-}
-
-
 class NodeNormDumper(LastModifiedHTTPDumper):
     SRC_NAME = "nodenorm"
     SRC_ROOT_FOLDER = Path(config.DATA_ARCHIVE_ROOT) / SRC_NAME
-    SCHEDULE = "0 2 1 * *"  # Monthly updates on the 1st of every month
     AUTO_UPLOAD = True
     SUFFIX_ATTR = "release"
 
     ARCHIVE = False
     SCHEDULE = None
+
+    VERSION_URL = VERSION_URL
+    SOURCE_ROOT_URL = BABEL_OUTPUT_ROOT
+    VERSION_REQUEST_TIMEOUT = 30
+
+    FILE_COLLECTION = NODENORM_FILE_COLLECTION
+    BIG_FILE_COLLECTION = NODENORM_BIG_FILE_COLLECTION
+    CONFLATION_COLLECTION = NODENORM_CONFLATION_COLLECTION
 
     MAX_PARALLEL_LARGE_FILES = 2
     LARGE_FILE_RANGE_WORKERS = 8
@@ -67,31 +68,49 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         self.to_dump_large = []
 
     def create_todump_list(self, force: bool = False) -> None:
+        self.to_dump = []
+        self.to_dump_large = []
         self.set_release()
-        local_datafolder = Path(self.current_data_folder)
 
-        for nodenorm_file in file_collections["compendia"]:
+        if not force and self.current_release:
+            try:
+                validate_release(self.current_release)
+                if self.release == self.current_release:
+                    self.logger.info(
+                        "NodeNorm release %s is already current",
+                        self.release,
+                    )
+                    return
+            except NodeNormReleaseError:
+                self.logger.warning(
+                    "Current NodeNorm release %r is invalid; downloading %s",
+                    self.current_release,
+                    self.release,
+                )
+
+        release_url = f"{self.SOURCE_ROOT_URL}/{self.release}"
+        local_datafolder = Path(self.new_data_folder)
+
+        for nodenorm_file in self.FILE_COLLECTION:
             self.to_dump.append(
                 {
-                    "remote": f"{BASE_URL}/compendia/{nodenorm_file}",
+                    "remote": f"{release_url}/compendia/{nodenorm_file}",
                     "local": str(local_datafolder.joinpath(nodenorm_file)),
                 }
             )
 
-        for nodenorm_file in file_collections["conflation"]:
+        for nodenorm_file in self.CONFLATION_COLLECTION:
             self.to_dump.append(
                 {
-                    "remote": f"{BASE_URL}/conflation/{nodenorm_file}",
+                    "remote": f"{release_url}/conflation/{nodenorm_file}",
                     "local": str(local_datafolder.joinpath(nodenorm_file)),
                 }
             )
 
-        for nodenorm_file, file_partitions in file_collections[
-            "compendia-large"
-        ].items():
+        for nodenorm_file, file_partitions in self.BIG_FILE_COLLECTION.items():
             self.to_dump_large.append(
                 {
-                    "remoteurl": f"{BASE_URL}/compendia/{nodenorm_file}",
+                    "remoteurl": f"{release_url}/compendia/{nodenorm_file}",
                     "localfile": str(local_datafolder.joinpath(nodenorm_file)),
                     "num_partitions": file_partitions,
                 }
@@ -203,9 +222,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         if headers is None:
             chunks = self.get_range_chunks(remoteurl, num_partitions)
         else:
-            chunks = self.get_range_chunks(
-                remoteurl, num_partitions, headers=headers
-            )
+            chunks = self.get_range_chunks(remoteurl, num_partitions, headers=headers)
         chunk_paths = [
             Path(f"{local_path}.part{index}") for index in range(len(chunks))
         ]
@@ -213,9 +230,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         workers = min(max_workers, len(chunks))
         future_to_chunk = {}
         try:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=workers
-            ) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 for chunk_path, (chunk_start, chunk_end) in zip(chunk_paths, chunks):
                     download_arguments = {
                         "url": remoteurl,
@@ -268,9 +283,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         request_arguments = {"timeout": self.RANGE_REQUEST_TIMEOUT}
         if headers is not None:
             request_arguments["headers"] = {
-                key: value
-                for key, value in headers.items()
-                if key.lower() != "range"
+                key: value for key, value in headers.items() if key.lower() != "range"
             }
         try:
             response = self.client.head(url, **request_arguments)
@@ -359,10 +372,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
                         f"Error while downloading '{url}' range {start}-{end} "
                         f"(status: {response.status_code}, reason: {response.reason})"
                     )
-                    if (
-                        response.status_code
-                        not in self.RETRYABLE_HTTP_STATUS_CODES
-                    ):
+                    if response.status_code not in self.RETRYABLE_HTTP_STATUS_CODES:
                         raise DumperException(message)
                     raise _RetryableRangeDownloadError(message)
 
@@ -445,19 +455,43 @@ class NodeNormDumper(LastModifiedHTTPDumper):
             chunk_path.unlink(missing_ok=True)
             Path(f"{chunk_path}.tmp").unlink(missing_ok=True)
 
+    def get_release(self) -> str:
+        """Return the official release named by RENCI's VERSION.txt marker."""
+
+        response = None
+        try:
+            response = self.client.get(
+                self.VERSION_URL,
+                timeout=self.VERSION_REQUEST_TIMEOUT,
+            )
+            if response.status_code >= 400:
+                raise DumperException(
+                    f"Unable to read NodeNorm release marker '{self.VERSION_URL}' "
+                    f"(status: {response.status_code}, reason: {response.reason})"
+                )
+            try:
+                return parse_version_marker(response.text)
+            except NodeNormReleaseError as exc:
+                raise DumperException(
+                    f"Invalid NodeNorm release marker '{self.VERSION_URL}': {exc}"
+                ) from exc
+        except requests_exceptions.RequestException as exc:
+            raise DumperException(
+                f"Unable to read NodeNorm release marker '{self.VERSION_URL}': {exc}"
+            ) from exc
+        finally:
+            if response is not None:
+                response.close()
+
     def set_release(self) -> None:
-        """
-        Parses the BASE_URL to extract the data from the url pathing
-        """
-        parse_result = urlparse(BASE_URL)
-        self.release = parse_result.path.split("/")[-1]
+        """Set the SDK release value from RENCI's authoritative marker."""
+
+        self.release = self.get_release()
 
     def post_dump(self, *args, **kwargs):
-        # Force creation of the to_dump collection
-        self.create_todump_list(force=True)
-        local_zip_file = self.to_dump[0]["local"]
-        data_directory = Path(local_zip_file).parent
+        data_directory = Path(self.new_data_folder)
         self._generate_conflation_database(data_directory)
+        super().post_dump(*args, **kwargs)
 
     def _generate_conflation_database(
         self, data_directory: Union[str, Path]
