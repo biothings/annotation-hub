@@ -93,6 +93,7 @@ def make_dumper(nodenorm_modules, tmp_path, marker, current_release=None):
     dumper = object.__new__(nodenorm_modules.dumper.NodeNormDumper)
     dumper.to_dump = []
     dumper.to_dump_large = []
+    dumper.PINNED_RELEASE = None
     dumper.current_release = current_release
     dumper.new_data_folder = str(tmp_path / "nodenorm" / "latest")
     dumper.logger = logging.getLogger("test_nodenorm_release.instance")
@@ -266,3 +267,30 @@ def test_post_dump_uses_selected_release_without_refetching(nodenorm_modules, tm
 
 def test_production_retains_single_snapshot(nodenorm_modules):
     assert nodenorm_modules.dumper.NodeNormDumper.ARCHIVE is False
+
+
+def test_operations_branch_only_pins_release(nodenorm_modules, tmp_path):
+    dumper = object.__new__(nodenorm_modules.dumper.NodeNormDumper)
+    dumper.to_dump = []
+    dumper.to_dump_large = []
+    dumper.current_release = "2025sep1"
+    dumper.new_data_folder = str(tmp_path / "nodenorm" / "latest")
+    dumper.logger = logging.getLogger("test_nodenorm_pinned_release.instance")
+    dumper.client = FakeClient([])
+
+    dumper.create_todump_list()
+
+    assert dumper.SRC_NAME == "nodenorm"
+    assert dumper.PINNED_RELEASE == "2026jul22"
+    assert dumper.release == "2026jul22"
+    assert dumper.client.get_calls == []
+    assert all(
+        item["remote"].startswith(
+            "https://stars.renci.org/var/babel_outputs/2026jul22/"
+        )
+        for item in dumper.to_dump
+    )
+    assert all(
+        Path(item["local"]).parent == tmp_path / "nodenorm" / "latest"
+        for item in dumper.to_dump
+    )

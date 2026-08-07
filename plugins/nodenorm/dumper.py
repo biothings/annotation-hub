@@ -44,6 +44,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
     VERSION_URL = VERSION_URL
     SOURCE_ROOT_URL = BABEL_OUTPUT_ROOT
     VERSION_REQUEST_TIMEOUT = 30
+    PINNED_RELEASE = "2026jul22"
 
     FILE_COLLECTION = NODENORM_FILE_COLLECTION
     BIG_FILE_COLLECTION = NODENORM_BIG_FILE_COLLECTION
@@ -456,7 +457,10 @@ class NodeNormDumper(LastModifiedHTTPDumper):
             Path(f"{chunk_path}.tmp").unlink(missing_ok=True)
 
     def get_release(self) -> str:
-        """Return the official release named by RENCI's VERSION.txt marker."""
+        """Return the branch override or RENCI's official release marker."""
+
+        if self.PINNED_RELEASE is not None:
+            return validate_release(self.PINNED_RELEASE)
 
         response = None
         try:
