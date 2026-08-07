@@ -6,11 +6,12 @@ from biothings.hub.dataload.uploader import ParallelizedSourceUploader
 
 from .mapping import get_pubmed_metadata_mapping
 from .parser import iter_pubmed_metadata_documents
+from .release import PubMedReleaseError, local_shard_paths
 from .static import (
-    BASE_URL,
     NLM_TERMS_URL,
     PUBMED2DB_URL,
-    PUBMED_METADATA_FILES,
+    PUBMED_METADATA_ROOT_URL,
+    VALIDATION_REPORT_FILENAME,
 )
 
 
@@ -22,7 +23,7 @@ class PubMedMetadataUploader(ParallelizedSourceUploader):
     keep_archive = 1
     __metadata__ = {
         "src_meta": {
-            "url": BASE_URL,
+            "url": PUBMED_METADATA_ROOT_URL,
             "license": "NLM PubMed Terms and Conditions",
             "license_url": NLM_TERMS_URL,
             "description": (
@@ -34,14 +35,13 @@ class PubMedMetadataUploader(ParallelizedSourceUploader):
 
     def jobs(self) -> list[tuple[str]]:
         data_folder = Path(self.data_folder)
-        shard_paths = [data_folder / filename for filename in PUBMED_METADATA_FILES]
-        missing_paths = [path.name for path in shard_paths if not path.is_file()]
-        if missing_paths:
+        try:
+            shard_paths = local_shard_paths(data_folder, VALIDATION_REPORT_FILENAME)
+        except PubMedReleaseError as exc:
             raise FileNotFoundError(
-                "PubMed metadata upload requires all "
-                f"{len(PUBMED_METADATA_FILES)} shards; missing: "
-                + ", ".join(missing_paths)
-            )
+                "PubMed metadata upload requires the complete validated "
+                f"release: {exc}"
+            ) from exc
         return [(str(path),) for path in shard_paths]
 
     def load_data(self, data_path: str):

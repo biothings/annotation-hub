@@ -1,8 +1,10 @@
 # PubMed metadata
 
-This NodeAnnotator source ingests the RENCI `pubmed2db` snapshot published at
-<https://stars.renci.org/var/babel_outputs/pubmed2db/2026jun30/>. The pinned
-release contains 16 gzip-compressed NDJSON shards (about 16.85 GB compressed).
+This NodeAnnotator source ingests dated RENCI `pubmed2db` snapshots published
+under <https://stars.renci.org/var/babel_outputs/pubmed2db/>. On each manually
+triggered dump, it selects the newest completed release, records the dated
+directory name as the BioThings source release, and archives the release in its
+own data folder.
 
 Each upstream record is stored under a `pubmed` source key in a standalone
 PubMed index:
@@ -37,11 +39,22 @@ available publication-date precision: `YYYY-MM-DD` when all parts exist,
 omits `pub_date` when the year is absent. Elasticsearch maps all three forms as
 a date; partial dates sort at the beginning of their represented period.
 
-Downloads and uploads are each capped at four concurrent shards. Abstracts are
-retained in Elasticsearch `_source` but are not indexed or sortable. The other
-metadata fields are indexed. `title` supports full-text matching and relevance
-scoring but is not sortable. `journal.name` uses its `.raw` keyword subfield
-when sorting; the keyword and date fields are directly sortable.
+Before queueing a large download, the dumper requires the release's
+`validation_report.json.gz`, verifies that it reports no errors and passes all
+structural checks, and confirms that its shard inventory matches a nonempty set
+of contiguous files beginning at shard `00000`. A release directory without a
+validation report is treated as incomplete. The report is retained alongside
+the downloaded shards for auditability and is checked again after download.
+Overall report warnings are allowed when the error list is empty and every
+required structural check passes.
+
+Downloads and uploads are each capped at four concurrent shards. Dumps are not
+scheduled automatically because each full snapshot is very large; an operator
+must trigger the release check. Abstracts are retained in Elasticsearch
+`_source` but are not indexed or sortable. The other metadata fields are
+indexed. `title` supports full-text matching and relevance scoring but is not
+sortable. `journal.name` uses its `.raw` keyword subfield when sorting; the
+keyword and date fields are directly sortable.
 Because this is a very large source, the uploader retains only one previous
 MongoDB source collection instead of the BioThings default of ten.
 
@@ -56,8 +69,10 @@ Build configuration and alias state are deployment state and are not stored in
 this repository.
 
 This is a full snapshot rather than an incremental feed. DOI and PMC identifiers
-are not present in this export. To adopt a newer snapshot, update `RELEASE` in
-`static.py` and verify that its shard count and schema are unchanged.
+are not present in this export. Release discovery is based on the upstream
+`YYYYmonD`/`YYYYmonDD` directory names, while release completeness and schema
+compatibility are gated by the published validation report and the parser's
+strict record validation.
 
 The export is produced by [TranslatorSRI/pubmed2db](https://github.com/TranslatorSRI/pubmed2db)
 from NLM PubMed data. Downstream use must follow the
