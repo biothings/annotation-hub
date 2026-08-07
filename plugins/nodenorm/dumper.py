@@ -49,6 +49,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
     BIG_FILE_COLLECTION = NODENORM_BIG_FILE_COLLECTION
     CONFLATION_COLLECTION = NODENORM_CONFLATION_COLLECTION
 
+    MAX_PARALLEL_NORMAL_FILES = 4
     MAX_PARALLEL_LARGE_FILES = 2
     LARGE_FILE_RANGE_WORKERS = 8
     NORMAL_FILE_RANGE_WORKERS = 2
@@ -124,22 +125,30 @@ class NodeNormDumper(LastModifiedHTTPDumper):
 
     async def _handle_normal_size_files(self, job_manager: JobManager):
         self.logger.info("%d file(s) to download (normal size)", len(self.to_dump))
-        jobs = []
         self.unprepare()
-        for file_mapping in self.to_dump:
-            remote = file_mapping["remote"]
-            local = file_mapping["local"]
 
-            pinfo = self.get_pinfo()
-            pinfo["step"] = "dump"
-            pinfo["description"] = remote
+        for batch_start in range(
+            0, len(self.to_dump), self.MAX_PARALLEL_NORMAL_FILES
+        ):
+            jobs = []
+            batch = self.to_dump[
+                batch_start : batch_start + self.MAX_PARALLEL_NORMAL_FILES
+            ]
+            for file_mapping in batch:
+                remote = file_mapping["remote"]
+                local = file_mapping["local"]
 
-            job = await job_manager.defer_to_process(
-                pinfo, partial(self.download, remote, local)
-            )
-            jobs.append(job)
+                pinfo = self.get_pinfo()
+                pinfo["step"] = "dump"
+                pinfo["description"] = remote
 
-        await asyncio.gather(*jobs)
+                job = await job_manager.defer_to_process(
+                    pinfo, partial(self.download, remote, local)
+                )
+                jobs.append(job)
+
+            await asyncio.gather(*jobs)
+
         self.to_dump = []
 
     async def _handle_large_size_files(self, job_manager: JobManager):
@@ -285,34 +294,65 @@ class NodeNormDumper(LastModifiedHTTPDumper):
             request_arguments["headers"] = {
                 key: value for key, value in headers.items() if key.lower() != "range"
             }
-        try:
-            response = self.client.head(url, **request_arguments)
-        except requests_exceptions.RequestException as exc:
-            raise DumperException(
-                f"Unable to determine size of '{url}': {exc}"
-            ) from exc
 
-        try:
-            if response.status_code >= 400:
-                raise DumperException(
-                    f"Unable to determine size of '{url}' "
-                    f"(status: {response.status_code}, reason: {response.reason})"
-                )
-            content_length = response.headers.get("Content-Length")
+        for attempt in range(1, self.RANGE_DOWNLOAD_MAX_ATTEMPTS + 1):
+            response = None
+            retry_error = None
             try:
-                size = int(content_length)
-            except (TypeError, ValueError) as exc:
+                response = self.client.head(url, **request_arguments)
+                if response.status_code >= 400:
+                    message = (
+                        f"Unable to determine size of '{url}' "
+                        f"(status: {response.status_code}, "
+                        f"reason: {response.reason})"
+                    )
+                    if response.status_code not in self.RETRYABLE_HTTP_STATUS_CODES:
+                        raise DumperException(message)
+                    retry_error = DumperException(message)
+                else:
+                    content_length = response.headers.get("Content-Length")
+                    try:
+                        size = int(content_length)
+                    except (TypeError, ValueError) as exc:
+                        raise DumperException(
+                            f"Unable to determine size of '{url}': "
+                            f"invalid Content-Length {content_length!r}"
+                        ) from exc
+                    if size <= 0:
+                        raise DumperException(
+                            f"Unable to determine size of '{url}': "
+                            "invalid Content-Length"
+                        )
+                    return size
+            except (
+                requests_exceptions.ConnectionError,
+                requests_exceptions.Timeout,
+            ) as exc:
+                retry_error = exc
+            except requests_exceptions.RequestException as exc:
                 raise DumperException(
-                    f"Unable to determine size of '{url}': "
-                    f"invalid Content-Length {content_length!r}"
+                    f"Unable to determine size of '{url}': {exc}"
                 ) from exc
-            if size <= 0:
+            finally:
+                if response is not None:
+                    response.close()
+
+            if attempt == self.RANGE_DOWNLOAD_MAX_ATTEMPTS:
                 raise DumperException(
-                    f"Unable to determine size of '{url}': invalid Content-Length"
-                )
-            return size
-        finally:
-            response.close()
+                    f"Unable to determine size of '{url}' after {attempt} "
+                    f"attempts: {retry_error}"
+                ) from retry_error
+
+            delay = self.RANGE_DOWNLOAD_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            self.logger.warning(
+                "Retrying size request for '%s' in %d seconds after "
+                "attempt %d failed: %s",
+                url,
+                delay,
+                attempt,
+                retry_error,
+            )
+            time.sleep(delay)
 
     def get_range_chunks(
         self, url: str, num_partitions: int = 10, headers: dict = None

@@ -188,22 +188,97 @@ def test_get_file_size_rejects_invalid_content_length(
 
 
 def test_get_file_size_wraps_request_errors(range_dumper_module):
-    request_error = range_dumper_module.requests_exceptions.Timeout(
-        "request timed out"
+    request_error = range_dumper_module.requests_exceptions.TooManyRedirects(
+        "too many redirects"
     )
     dumper = make_dumper(range_dumper_module)
     dumper.client = FakeClient([request_error])
 
     with pytest.raises(
         range_dumper_module.DumperException,
-        match="Unable to determine size.*request timed out",
+        match="Unable to determine size.*too many redirects",
     ):
         dumper.get_file_size("https://example.test/data")
+
+    assert len(dumper.client.head_calls) == 1
 
     assert (
         dumper.client.head_calls[0][1]["timeout"]
         == dumper.RANGE_REQUEST_TIMEOUT
     )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param("connect-timeout", id="connect-timeout"),
+        pytest.param("retryable-status", id="retryable-status"),
+    ],
+)
+def test_get_file_size_retries_transient_failures(range_dumper_module, failure):
+    success_response = FakeResponse(
+        status_code=200, headers={"Content-Length": "123"}
+    )
+    if failure == "connect-timeout":
+        first_result = range_dumper_module.requests_exceptions.ConnectTimeout(
+            "connection timed out"
+        )
+    else:
+        first_result = FakeResponse(
+            status_code=503, reason="Service Unavailable"
+        )
+
+    dumper = make_dumper(range_dumper_module)
+    dumper.client = FakeClient([first_result, success_response])
+    dumper.RANGE_DOWNLOAD_MAX_ATTEMPTS = 2
+    dumper.RANGE_DOWNLOAD_BACKOFF_SECONDS = 0
+
+    assert dumper.get_file_size("https://example.test/data") == 123
+    assert len(dumper.client.head_calls) == 2
+    assert all(
+        call[1]["timeout"] == dumper.RANGE_REQUEST_TIMEOUT
+        for call in dumper.client.head_calls
+    )
+    if isinstance(first_result, FakeResponse):
+        assert first_result.closed is True
+    assert success_response.closed is True
+
+
+def test_get_file_size_reports_retry_exhaustion(range_dumper_module):
+    request_errors = [
+        range_dumper_module.requests_exceptions.ConnectTimeout(
+            f"connection timed out {attempt}"
+        )
+        for attempt in range(2)
+    ]
+    dumper = make_dumper(range_dumper_module)
+    dumper.client = FakeClient(request_errors)
+    dumper.RANGE_DOWNLOAD_MAX_ATTEMPTS = 2
+    dumper.RANGE_DOWNLOAD_BACKOFF_SECONDS = 0
+
+    with pytest.raises(
+        range_dumper_module.DumperException,
+        match="Unable to determine size.*after 2 attempts.*connection timed out 1",
+    ):
+        dumper.get_file_size("https://example.test/data")
+
+    assert len(dumper.client.head_calls) == 2
+
+
+def test_get_file_size_does_not_retry_nonretryable_status(range_dumper_module):
+    response = FakeResponse(status_code=404, reason="Not Found")
+    dumper = make_dumper(range_dumper_module)
+    dumper.client = FakeClient([response])
+    dumper.RANGE_DOWNLOAD_BACKOFF_SECONDS = 0
+
+    with pytest.raises(
+        range_dumper_module.DumperException,
+        match="status: 404, reason: Not Found",
+    ):
+        dumper.get_file_size("https://example.test/data")
+
+    assert len(dumper.client.head_calls) == 1
+    assert response.closed is True
 
 
 def test_custom_headers_are_applied_to_size_and_range_requests(
@@ -409,3 +484,42 @@ def test_large_file_concurrency_is_bounded(range_dumper_module):
 
     assert job_manager.peak_jobs == 2
     assert dumper.to_dump_large == []
+
+
+def test_normal_file_concurrency_is_bounded(range_dumper_module):
+    dumper = make_dumper(range_dumper_module)
+    dumper.MAX_PARALLEL_NORMAL_FILES = 4
+    dumper.to_dump = [
+        {
+            "remote": f"https://example.test/data-{index}",
+            "local": f"/tmp/data-{index}",
+        }
+        for index in range(9)
+    ]
+    dumper.unprepare = lambda: None
+    dumper.get_pinfo = lambda: {}
+
+    class FakeJobManager:
+        def __init__(self):
+            self.active_jobs = 0
+            self.peak_jobs = 0
+
+        async def defer_to_process(self, pinfo, function):
+            del pinfo, function
+
+            async def run_job():
+                self.active_jobs += 1
+                self.peak_jobs = max(self.peak_jobs, self.active_jobs)
+                try:
+                    await asyncio.sleep(0.01)
+                finally:
+                    self.active_jobs -= 1
+
+            return asyncio.create_task(run_job())
+
+    job_manager = FakeJobManager()
+
+    asyncio.run(dumper._handle_normal_size_files(job_manager))
+
+    assert job_manager.peak_jobs == 4
+    assert dumper.to_dump == []
