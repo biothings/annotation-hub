@@ -682,8 +682,8 @@ def cleanup_curie_duplication(
     """
     Handle the CURIE duplication directly in the mongodb database
 
-    Returns the number of correction requests issued and the number of duplicate
-    CURIEs the handler could not evaluate.
+    Returns the number of operations MongoDB applied and the number of duplicate
+    CURIEs left unresolved.
 
     A CURIE we cannot reason about is a condition of the upstream data rather
     than a processing failure, and leaving it alone is no worse than not running
@@ -693,12 +693,17 @@ def cleanup_curie_duplication(
 
     Neither count establishes that `identifiers.i` is unique afterwards, which is
     the 1-1 mapping the Elasticsearch terms query depends on (see README,
-    "Post Upload Processing"). Corrections are write requests issued, not
-    documents observed to change, and the identifier comparisons the handler
-    makes are whole-dictionary rather than CURIE-only, so a shared CURIE carrying
-    different labels can produce a request that changes nothing while still
-    counting as resolved. Enforcing uniqueness needs a check against the
-    collection, not these counters.
+    "Post Upload Processing"):
+
+    - corrections are documents deleted plus documents modified, so they are not
+      a count of distinct documents, and repairing several CURIEs on one document
+      can report fewer corrections than CURIEs resolved;
+    - a pull the server declines in order to keep a document non-empty applies
+      nothing and is indistinguishable here from one that had already been
+      applied, so it is not counted unresolved even though the CURIE still is.
+
+    Validating the collection against the shard CURIE set before the uploader
+    promotes it is what settles uniqueness. These counters are for reporting.
     """
     logger.info("Handling CURIE duplication issue")
 
@@ -736,8 +741,8 @@ def cleanup_curie_duplication(
             raise
 
     logger.info(
-        "CURIE duplicate cleanup issued %s correction request(s) and could not "
-        "evaluate %s duplicate CURIE(s)",
+        "CURIE duplicate cleanup applied %s operation(s) and left %s duplicate "
+        "CURIE(s) unresolved; this is not a uniqueness check",
         total_correction_count,
         total_unresolved_count,
     )
@@ -892,7 +897,17 @@ def _evaluate_document_intersection(
         main_document["_id"],
     )
     return pymongo.UpdateOne(
-        {"_id": side_document["_id"]},
+        {
+            "_id": side_document["_id"],
+            # The check above only proves this pull spares an identifier in the
+            # snapshot it was planned from. A document sharing one CURIE with a
+            # Protein clique can share another with a different one, and those
+            # pulls compose: each spares something on its own and together they
+            # empty the document. Restate the requirement as part of the filter so
+            # the server evaluates it against the document as it stands at write
+            # time, whichever batch or worker gets there first.
+            "identifiers": {"$elemMatch": {"i": {"$nin": colliding_curies}}},
+        },
         {"$pull": {"identifiers": {"i": {"$in": colliding_curies}}}},
     )
 
@@ -900,12 +915,16 @@ def _evaluate_document_intersection(
 def _resolve_document_pair(
     task_id: int, documents: list[dict], duplicate_curie: str
 ) -> tuple[Union[object, None], bool]:
-    if len(documents[0]["identifiers"]) > len(documents[1]["identifiers"]):
-        more_identifiers_doc = documents[0]
-        less_identifiers_doc = documents[1]
-    else:
-        more_identifiers_doc = documents[1]
-        less_identifiers_doc = documents[0]
+    # find() has no defined order, so picking the survivor by position makes the
+    # choice depend on how each query happened to come back. Two CURIEs shared by
+    # the same pair of documents could then nominate each other's keeper for
+    # deletion and remove both. Order on the identifier count with the _id as
+    # tiebreak, so every CURIE and every worker resolves a given pair the same way
+    # and the redundant deletes collapse onto one document.
+    more_identifiers_doc, less_identifiers_doc = sorted(
+        documents,
+        key=lambda document: (-len(document["identifiers"]), str(document["_id"])),
+    )
 
     operation = _evaluate_document_subset(
         task_id, more_identifiers_doc, less_identifiers_doc
@@ -966,7 +985,13 @@ def _curie_duplication_batch_handler(
                 num_retry - counter,
             )
 
-    buffer = []
+    # Trims are kept apart from the pair repairs so their misses stay
+    # attributable: a trim is pinned to the identifier array it read, so a filter
+    # that matches nothing means the repeat is still there, whereas a pair repair
+    # that applies nothing has usually just been applied already by way of another
+    # CURIE on the same document.
+    trim_operations = []
+    pair_operations = []
     unresolved_count = 0
     for result in curies:
         # Named distinctly from the identifier documents inspected below, which
@@ -980,16 +1005,18 @@ def _curie_duplication_batch_handler(
             operation, unresolved = _deduplicate_document_identifiers(
                 task_id, documents[0]
             )
+            operations = trim_operations
         # Handle case where the identifier.i is spread across 2 documents
         elif len(documents) == 2:
             operation, unresolved = _resolve_document_pair(
                 task_id, documents, duplicate_curie
             )
+            operations = pair_operations
         # A CURIE the identifier shards counted more than once should be found in
         # 1 or 2 documents. Anything else is outside what the branches above can
         # reason about, so leave the documents as they are and report it.
         else:
-            operation, unresolved = None, True
+            operation, unresolved, operations = None, True, pair_operations
             logger.critical(
                 "[Task %d] Unable to resolve duplicate CURIE %s: found in %d "
                 "document(s), expected 1 or 2",
@@ -1001,31 +1028,49 @@ def _curie_duplication_batch_handler(
         if unresolved:
             unresolved_count += 1
         elif operation is not None:
-            buffer.append(operation)
+            operations.append(operation)
 
-    if len(buffer) == 0:
+    request_count = len(trim_operations) + len(pair_operations)
+    if request_count == 0:
         logger.debug(
             "[Task %d] Bulk writing found no changes to collection to apply", task_id
         )
         return task_id, 0, unresolved_count
 
     logger.debug(
-        "[Task %d] Bulk writing %s changes to collection", task_id, len(buffer)
+        "[Task %d] Bulk writing %s changes to collection", task_id, request_count
     )
-    write_result = collection.bulk_write(buffer)
-    correction_count = write_result.deleted_count + write_result.modified_count
+    correction_count = 0
 
-    # Requests that applied nothing are expected: the operations are idempotent so
-    # that concurrent workers compose, and a CURIE already repaired by way of
-    # another CURIE on the same document applies once. A shortfall is worth
-    # surfacing anyway, since it also covers a trim whose document changed
-    # underneath it.
-    if correction_count < len(buffer):
+    if trim_operations:
+        trim_result = collection.bulk_write(trim_operations)
+        correction_count += trim_result.modified_count
+        # matched_count separates a document that moved underneath the trim from
+        # one the trim matched and left alone; only the former leaves a repeat
+        missed_trim_count = len(trim_operations) - trim_result.matched_count
+        if missed_trim_count > 0:
+            unresolved_count += missed_trim_count
+            logger.warning(
+                "[Task %d] %d repeated-CURIE trim(s) did not apply because their "
+                "document changed underneath them; counting them unresolved",
+                task_id,
+                missed_trim_count,
+            )
+
+    if pair_operations:
+        pair_result = collection.bulk_write(pair_operations)
+        correction_count += pair_result.deleted_count + pair_result.modified_count
+
+    # Correction counts are operations MongoDB applied, so they do not establish
+    # that identifiers.i is unique afterwards: a pull the server declined in order
+    # to keep a document non-empty also applies nothing. Validating the collection
+    # is what settles that.
+    if correction_count < request_count:
         logger.debug(
             "[Task %d] %d of %d write request(s) applied; the rest were already "
-            "satisfied or their document changed underneath them",
+            "satisfied or were declined by their filter",
             task_id,
             correction_count,
-            len(buffer),
+            request_count,
         )
     return task_id, correction_count, unresolved_count

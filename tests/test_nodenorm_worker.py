@@ -113,9 +113,10 @@ def worker_module(monkeypatch, tmp_path):
 
 
 class FakeBulkWriteResult:
-    def __init__(self, deleted_count, modified_count):
+    def __init__(self, deleted_count, modified_count, matched_count):
         self.deleted_count = deleted_count
         self.modified_count = modified_count
+        self.matched_count = matched_count
 
 
 class FakeMongoCollection:
@@ -167,10 +168,28 @@ class FakeMongoCollection:
                 counts[identifier["i"]] = counts.get(identifier["i"], 0) + 1
         return {curie for curie, count in counts.items() if count > 1}
 
+    @staticmethod
+    def matches(document, query):
+        """
+        Evaluate the two `identifiers` predicates the cleanup relies on: an exact
+        array for the compare-and-swap trim, and `$elemMatch` with `$nin` for the
+        pull's "must leave something behind" guard.
+        """
+        condition = query.get("identifiers")
+        if condition is None:
+            return True
+        if isinstance(condition, list):
+            return condition == document["identifiers"]
+        excluded = set(condition["$elemMatch"]["i"]["$nin"])
+        return any(
+            identifier["i"] not in excluded for identifier in document["identifiers"]
+        )
+
     def bulk_write(self, requests):
         self.bulk_write_calls.append(list(requests))
         deleted_count = 0
         modified_count = 0
+        matched_count = 0
         for request in requests:
             request_kind = type(request).__name__
             if request_kind == "DeleteOne":
@@ -184,15 +203,9 @@ class FakeMongoCollection:
             assert request_kind == "UpdateOne", f"unsupported request {request_kind}"
             query, update = request.arguments
             document = self.stored(query["_id"])
-            if document is None:
+            if document is None or not self.matches(document, query):
                 continue
-            # compare-and-swap guard: a document changed since it was read no
-            # longer matches, so the update applies to nothing
-            if (
-                "identifiers" in query
-                and query["identifiers"] != document["identifiers"]
-            ):
-                continue
+            matched_count += 1
 
             if "$set" in update:
                 replacement = update["$set"]["identifiers"]
@@ -211,7 +224,7 @@ class FakeMongoCollection:
             document["identifiers"] = copy.deepcopy(replacement)
             modified_count += 1
 
-        return FakeBulkWriteResult(deleted_count, modified_count)
+        return FakeBulkWriteResult(deleted_count, modified_count, matched_count)
 
 
 def install_fake_collection(worker_module, monkeypatch, documents=()):
@@ -735,6 +748,9 @@ def test_trim_does_not_clobber_a_document_changed_underneath_it(
     The trim pins the identifier array it read. Another worker repairing a
     different CURIE on the same document wins, and the trim applies nothing
     rather than reinstating the identifiers that worker removed.
+
+    A miss is reported unresolved rather than passing as resolved: nothing was
+    written, so anything still repeated in that document is still repeated.
     """
     collection = install_fake_collection(
         worker_module,
@@ -751,8 +767,112 @@ def test_trim_does_not_clobber_a_document_changed_underneath_it(
 
     monkeypatch.setattr(collection, "find", find_then_change)
 
-    assert run_batch(worker_module, ["CURIE:dupe"]) == (0, 0, 0)
+    assert run_batch(worker_module, ["CURIE:dupe"]) == (0, 0, 1)
     assert collection.curies("d1") == ["CURIE:dupe"]
+
+
+def test_composed_pulls_never_empty_a_document(worker_module, monkeypatch):
+    """
+    One document sharing a different CURIE with each of two Protein cliques.
+
+    Each pull spares an identifier when judged against the snapshot it was planned
+    from, so a per-CURIE check passes both, and applying both empties the document.
+    The guard is restated in the filter so the server re-evaluates it at write
+    time; the second pull matches nothing and the document keeps an identifier.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("side", "CURIE:x", "CURIE:y"),
+            identifier_document(
+                "px", "CURIE:x", "CURIE:px", node_type="biolink:Protein"
+            ),
+            identifier_document(
+                "py", "CURIE:y", "CURIE:py", node_type="biolink:Protein"
+            ),
+        ],
+    )
+
+    task_id, corrections, unresolved = run_batch(worker_module, ["CURIE:x", "CURIE:y"])
+
+    assert collection.curies("side") != [], "the side document was emptied"
+    assert len(collection.curies("side")) == 1
+    assert (task_id, corrections, unresolved) == (0, 1, 0)
+    assert len(collection.bulk_write_calls[0]) == 2, "two pulls were issued"
+
+
+def test_equal_documents_do_not_delete_each_other(worker_module, monkeypatch):
+    """
+    Two documents with identical CURIE sets, where find() returns them in opposite
+    orders for the two CURIEs they share -- which it is free to do, since the query
+    is unsorted.
+
+    Choosing the survivor by position made each CURIE nominate the other's keeper
+    and deleted both, losing the CURIEs entirely. Ordering on the identifier count
+    with the _id as tiebreak makes both CURIEs agree, so the two deletes collapse
+    onto one document.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("a", "CURIE:x", "CURIE:y"),
+            identifier_document("b", "CURIE:x", "CURIE:y"),
+        ],
+    )
+    unsorted_find = collection.find
+
+    def find_in_opposite_orders(query):
+        documents = list(unsorted_find(query))
+        if query["identifiers.i"] == "CURIE:y":
+            documents.reverse()
+        return iter(documents)
+
+    monkeypatch.setattr(collection, "find", find_in_opposite_orders)
+
+    task_id, corrections, unresolved = run_batch(worker_module, ["CURIE:x", "CURIE:y"])
+
+    survivors = [document["_id"] for document in collection.documents]
+    assert survivors == ["a"], "the keeper was deleted too"
+    assert (task_id, corrections, unresolved) == (0, 1, 0)
+    assert collection.duplicated_curies() == set()
+
+
+def test_stale_subset_delete_from_another_worker_applies_once(
+    worker_module, monkeypatch
+):
+    """
+    Two workers resolving the two CURIEs a pair shares, the second reading a
+    snapshot taken before the first worker's delete landed. Both nominate the same
+    document because the choice no longer depends on query order, so the second
+    delete matches nothing and the keeper survives.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("keep", "CURIE:x", "CURIE:y", "CURIE:extra"),
+            identifier_document("drop", "CURIE:x", "CURIE:y"),
+        ],
+    )
+    stale_documents = [copy.deepcopy(document) for document in collection.documents]
+
+    # first worker resolves CURIE:x and its delete lands
+    assert run_batch(worker_module, ["CURIE:x"]) == (0, 1, 0)
+    assert collection.stored("drop") is None
+
+    # second worker resolves CURIE:y from the snapshot it read beforehand
+    monkeypatch.setattr(
+        collection,
+        "find",
+        lambda _query: iter([copy.deepcopy(d) for d in stale_documents]),
+    )
+
+    task_id, corrections, unresolved = run_batch(worker_module, ["CURIE:y"], task_id=1)
+
+    assert (task_id, corrections, unresolved) == (1, 0, 0)
+    assert [document["_id"] for document in collection.documents] == ["keep"]
 
 
 def test_pull_that_would_empty_a_document_is_left_unresolved(
