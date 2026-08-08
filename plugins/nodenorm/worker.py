@@ -678,12 +678,25 @@ def update_identifier_collection(cursor: sqlite3.Cursor, identifiers: list[str])
     cursor.executemany(upsert_statement, identifier_information)
 
 
-def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: str):
+def cleanup_curie_duplication(
+    data_folder: Union[str, Path], collection_name: str
+) -> tuple[int, int]:
     """
     Handle the CURIE duplication directly in the mongodb database
+
+    Returns the number of corrections applied and the number of duplicate CURIEs
+    left unresolved.
+
+    A CURIE we cannot reason about is a condition of the upstream data rather
+    than a processing failure, and leaving it alone is no worse than not running
+    the cleanup over it, so those are counted and reported in a single summary
+    instead of aborting an upload that is otherwise complete. Actual errors still
+    propagate.
     """
     logger.info("Handling CURIE duplication issue")
 
+    total_correction_count = 0
+    total_unresolved_count = 0
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=NODENORM_WORKER_COUNT
     ) as executor:
@@ -699,10 +712,10 @@ def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: st
                 future = executor.submit(_curie_duplication_batch_handler, **arguments)
                 process_futures.append(future)
 
-            total_correction_count = 0
             for future in concurrent.futures.as_completed(process_futures):
-                task_id, num_corrections = future.result()
+                task_id, num_corrections, num_unresolved = future.result()
                 total_correction_count += num_corrections
+                total_unresolved_count += num_unresolved
                 logger.debug(
                     "Task %s completed | Corrected %s documents | Total corrections %s",
                     task_id,
@@ -714,6 +727,21 @@ def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: st
                 pending_future.cancel()
             logger.exception("CURIE duplicate cleanup failed")
             raise
+
+    if total_unresolved_count > 0:
+        logger.warning(
+            "CURIE duplicate cleanup applied %s correction(s) and left %s "
+            "duplicate CURIE(s) unresolved; grep the log for "
+            "'Unable to resolve duplicate CURIE' for the individual CURIEs",
+            total_correction_count,
+            total_unresolved_count,
+        )
+    else:
+        logger.info(
+            "CURIE duplicate cleanup applied %s correction(s), none unresolved",
+            total_correction_count,
+        )
+    return total_correction_count, total_unresolved_count
 
 
 def _iter_duplicate_curies(data_folder: Union[str, Path]):
@@ -732,7 +760,7 @@ def _iter_duplicate_curies(data_folder: Union[str, Path]):
 
 def _curie_duplication_batch_handler(
     task_id: int, curies: list[str], collection_name: str
-):
+) -> tuple[int, int, int]:
 
     num_retry = 10
     counter = 0
@@ -762,10 +790,13 @@ def _curie_duplication_batch_handler(
             )
 
     buffer = []
+    unresolved_count = 0
     for result in curies:
-        identifier = result[0]
+        # Named distinctly from the identifier documents iterated below, which
+        # otherwise shadow it
+        duplicate_curie = result[0]
 
-        cursor = collection.find({"identifiers.i": identifier})
+        cursor = collection.find({"identifiers.i": duplicate_curie})
         documents = list(cursor)
 
         # Handle case where the identifier.i is duplicated within the same document
@@ -916,21 +947,38 @@ def _curie_duplication_batch_handler(
                 )
 
             if operation is None:
+                unresolved_count += 1
                 logger.critical(
-                    "[Task %d] Unable to evaluate identifer %s subset or intersection between documents",
+                    "[Task %d] Unable to resolve duplicate CURIE %s: neither the "
+                    "subset nor the intersection of the 2 documents sharing it "
+                    "can be evaluated",
                     task_id,
-                    identifier,
+                    duplicate_curie,
                 )
-            buffer.append(operation)
+            else:
+                buffer.append(operation)
 
-    if buffer is not None and len(buffer) > 0:
+        # A CURIE the identifier shards counted more than once should be found in
+        # 1 or 2 documents. Anything else is outside what the branches above can
+        # reason about, so leave the documents as they are and report it.
+        else:
+            unresolved_count += 1
+            logger.critical(
+                "[Task %d] Unable to resolve duplicate CURIE %s: found in %d "
+                "document(s), expected 1 or 2",
+                task_id,
+                duplicate_curie,
+                len(documents),
+            )
+
+    if len(buffer) > 0:
         logger.debug(
             "[Task %d] Bulk writing %s changes to collection", task_id, len(buffer)
         )
         collection.bulk_write(buffer)
-        return task_id, len(buffer)
-    else:
-        logger.debug(
-            "[Task %d] Bulk writing found no changes to collection to apply", task_id
-        )
-        return task_id, 0
+        return task_id, len(buffer), unresolved_count
+
+    logger.debug(
+        "[Task %d] Bulk writing found no changes to collection to apply", task_id
+    )
+    return task_id, 0, unresolved_count
