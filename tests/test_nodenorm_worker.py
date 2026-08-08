@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import itertools
 import json
@@ -109,6 +110,37 @@ def worker_module(monkeypatch, tmp_path):
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+class FakeMongoCollection:
+    def __init__(self, documents_by_curie=None):
+        self.documents_by_curie = documents_by_curie or {}
+        self.bulk_write_calls = []
+
+    def find(self, query):
+        # deepcopy so the handler mutating documents cannot alter the fixture
+        documents = self.documents_by_curie.get(query["identifiers.i"], [])
+        return iter(copy.deepcopy(documents))
+
+    def bulk_write(self, requests):
+        self.bulk_write_calls.append(list(requests))
+
+
+def install_fake_collection(worker_module, monkeypatch, documents_by_curie=None):
+    collection = FakeMongoCollection(documents_by_curie)
+    monkeypatch.setattr(
+        worker_module.pymongo.collection,
+        "Collection",
+        lambda database, name: collection,
+    )
+    return collection
+
+
+def identifier_document(curie, *other_curies, node_type="biolink:Disease"):
+    return {
+        "type": node_type,
+        "identifiers": [{"i": curie}] + [{"i": other} for other in other_curies],
+    }
 
 
 class FakeIdentifierConnection:
@@ -281,7 +313,7 @@ def test_duplicate_cleanup_failure_is_propagated_and_cancels_pending(
             return True
 
     failed_future = FakeFuture(error=cleanup_error)
-    pending_future = FakeFuture(result=(1, 0))
+    pending_future = FakeFuture(result=(1, 0, 0))
 
     class FakeExecutor:
         def __init__(self, **_kwargs):
@@ -434,3 +466,166 @@ def test_upload_raises_original_identifier_writer_error(worker_module, monkeypat
     assert raised.value is writer_error
     assert raised.value.__cause__ is worker_error
     assert post_upload_calls == []
+
+
+def test_unresolvable_curie_pair_is_counted_not_written(worker_module, monkeypatch):
+    """
+    Two documents share a CURIE, neither identifier list is a subset of the
+    other, and neither is biolink:Protein -- so both evaluators return None. The
+    operation must not reach the buffer: pymongo rejects None with
+    "None is not a valid request", which would fail the whole batch and discard
+    the corrections that were computed successfully.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        {
+            "CURIE:shared": [
+                identifier_document("CURIE:shared", "CURIE:a"),
+                identifier_document(
+                    "CURIE:shared", "CURIE:b", node_type="biolink:Gene"
+                ),
+            ]
+        },
+    )
+
+    task_id, num_corrections, num_unresolved = (
+        worker_module._curie_duplication_batch_handler(
+            task_id=7,
+            curies=[("CURIE:shared",)],
+            collection_name="collection",
+        )
+    )
+
+    assert (task_id, num_corrections, num_unresolved) == (7, 0, 1)
+    assert collection.bulk_write_calls == []
+
+
+@pytest.mark.parametrize(
+    "document_count",
+    [pytest.param(0, id="missing"), pytest.param(3, id="three-documents")],
+)
+def test_unexpected_document_count_is_counted_not_ignored(
+    worker_module, monkeypatch, document_count
+):
+    """
+    The identifier shards only record CURIEs seen more than once, so a CURIE
+    resolving to 0 or 3+ documents is outside what the handler can reason about.
+    Neither branch matches, so it used to be dropped with no log at all.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        {
+            "CURIE:odd": [
+                identifier_document("CURIE:odd", f"CURIE:{index}")
+                for index in range(document_count)
+            ]
+        },
+    )
+
+    task_id, num_corrections, num_unresolved = (
+        worker_module._curie_duplication_batch_handler(
+            task_id=3,
+            curies=[("CURIE:odd",)],
+            collection_name="collection",
+        )
+    )
+
+    assert (task_id, num_corrections, num_unresolved) == (3, 0, 1)
+    assert collection.bulk_write_calls == []
+
+
+def test_resolvable_curie_is_still_written_alongside_an_unresolvable_one(
+    worker_module, monkeypatch
+):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        {
+            # complete subset -> the smaller document can be deleted
+            "CURIE:subset": [
+                identifier_document("CURIE:subset", "CURIE:extra"),
+                identifier_document("CURIE:subset"),
+            ],
+            # neither subset nor intersection is evaluable
+            "CURIE:shared": [
+                identifier_document("CURIE:shared", "CURIE:a"),
+                identifier_document(
+                    "CURIE:shared", "CURIE:b", node_type="biolink:Gene"
+                ),
+            ],
+        },
+    )
+
+    task_id, num_corrections, num_unresolved = (
+        worker_module._curie_duplication_batch_handler(
+            task_id=1,
+            curies=[("CURIE:subset",), ("CURIE:shared",)],
+            collection_name="collection",
+        )
+    )
+
+    assert (task_id, num_corrections, num_unresolved) == (1, 1, 1)
+    assert len(collection.bulk_write_calls) == 1
+    written_requests = collection.bulk_write_calls[0]
+    assert len(written_requests) == 1
+    assert all(request is not None for request in written_requests)
+    assert isinstance(written_requests[0], worker_module.pymongo.DeleteOne)
+
+
+def test_duplicate_cleanup_aggregates_and_returns_unresolved_totals(
+    worker_module, monkeypatch
+):
+    batch_results = iter([(0, 2, 1), (1, 0, 3), (2, 5, 0)])
+    results_lock = threading.Lock()
+
+    def fake_batch_handler(task_id, curies, collection_name):
+        del task_id, curies, collection_name
+        with results_lock:
+            return next(batch_results)
+
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        lambda _data_folder: iter(("a", "b", "c")),
+    )
+    monkeypatch.setattr(
+        worker_module, "iter_n", lambda _curies, _size: (("a",), ("b",), ("c",))
+    )
+    monkeypatch.setattr(
+        worker_module, "_curie_duplication_batch_handler", fake_batch_handler
+    )
+
+    assert worker_module.cleanup_curie_duplication("data", "collection") == (7, 4)
+
+
+def test_duplicate_cleanup_still_propagates_real_errors(worker_module, monkeypatch):
+    """An unresolvable CURIE is tolerated; a genuine failure is not."""
+    bulk_write_error = RuntimeError("mongo bulk_write failed")
+
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        {
+            "CURIE:subset": [
+                identifier_document("CURIE:subset", "CURIE:extra"),
+                identifier_document("CURIE:subset"),
+            ]
+        },
+    )
+
+    def failing_bulk_write(_requests):
+        raise bulk_write_error
+
+    monkeypatch.setattr(collection, "bulk_write", failing_bulk_write)
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        lambda _data_folder: iter((("CURIE:subset",),)),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        worker_module.cleanup_curie_duplication("data", "collection")
+
+    assert raised.value is bulk_write_error
