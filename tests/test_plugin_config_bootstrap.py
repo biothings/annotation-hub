@@ -168,15 +168,22 @@ def test_spawned_nodenorm_worker_bootstraps_config_and_hub_db(tmp_path):
                     os.sysconf = sysconf
 
 
-            def main():
-                # Anything missing here is the environment, not the regression:
-                # the bootstrap under test only ever fails in the spawned child.
+            def probe_dependencies():
+                # Only third-party imports belong in here. The plugin import
+                # stays outside it so that a renamed or broken plugin module
+                # fails the test instead of quietly skipping it.
                 try:
                     import biothings.hub  # noqa: F401
-                    from plugins.nodenorm.worker import _configure_sqlite_tmpdir
+                    import pymongo  # noqa: F401
                 except ModuleNotFoundError as missing_dependency:
                     print(f"unusable environment: {{missing_dependency}}")
                     sys.exit(ENVIRONMENT_UNUSABLE_EXIT_CODE)
+
+
+            def main():
+                probe_dependencies()
+
+                from plugins.nodenorm.worker import _configure_sqlite_tmpdir
 
                 test_config = importlib.import_module(os.environ["HUB_CONFIG"])
                 allow_restricted_semaphore_query()
