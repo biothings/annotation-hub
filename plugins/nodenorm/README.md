@@ -335,6 +335,17 @@ on `identifiers.i`, which speeds up the document reads needed during duplicate c
 and throughput figures from the former single-database implementation do not describe the sharded
 layout and should be remeasured during a full upload.
 
+Duplicate cleanup is intentionally serial across 1,000-CURIE batches. A repair decision reads both
+documents but may update only one, so overlapping batches cannot safely make those decisions from
+stale snapshots. After cleanup, a bounded parallel validation pass checks every duplicate candidate
+through the MongoDB `identifiers.i` index and reports missing, cross-document, and within-document
+duplicates. This potentially expensive audit is disabled by default. Set
+`NODENORM_CURIE_VALIDATION_MODE = "report"` in the Hub configuration to run it without blocking
+promotion on its findings, or set it to `"strict"` to make violations and an incomplete audit block
+promotion. Leaving the setting unset, or explicitly setting it to `"off"`, skips the audit.
+Report mode does not suppress repair-integrity failures: write errors and surviving documents with
+no identifiers always block the upload.
+
 This leads to the different ways we have to resolve the duplicate CURIES:
 
 * Duplicate CURIE case 1: Identical documents besides the typing
