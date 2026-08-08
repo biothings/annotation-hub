@@ -684,14 +684,23 @@ def cleanup_curie_duplication(
     """
     Handle the CURIE duplication directly in the mongodb database
 
-    Returns the number of corrections applied and the number of duplicate CURIEs
-    left unresolved.
+    Returns the number of correction requests issued and the number of duplicate
+    CURIEs the handler could not evaluate.
 
     A CURIE we cannot reason about is a condition of the upstream data rather
     than a processing failure, and leaving it alone is no worse than not running
     the cleanup over it, so those are counted and reported in a single summary
     instead of aborting an upload that is otherwise complete. Actual errors still
     propagate.
+
+    Neither count establishes that `identifiers.i` is unique afterwards, which is
+    the 1-1 mapping the Elasticsearch terms query depends on (see README,
+    "Post Upload Processing"). Corrections are write requests issued, not
+    documents observed to change, and the identifier comparisons the handler
+    makes are whole-dictionary rather than CURIE-only, so a shared CURIE carrying
+    different labels can produce a request that changes nothing while still
+    counting as resolved. Enforcing uniqueness needs a check against the
+    collection, not these counters.
     """
     logger.info("Handling CURIE duplication issue")
 
@@ -728,18 +737,17 @@ def cleanup_curie_duplication(
             logger.exception("CURIE duplicate cleanup failed")
             raise
 
+    logger.info(
+        "CURIE duplicate cleanup issued %s correction request(s) and could not "
+        "evaluate %s duplicate CURIE(s)",
+        total_correction_count,
+        total_unresolved_count,
+    )
     if total_unresolved_count > 0:
         logger.warning(
-            "CURIE duplicate cleanup applied %s correction(s) and left %s "
-            "duplicate CURIE(s) unresolved; grep the log for "
+            "%s duplicate CURIE(s) were left as-is; grep the log for "
             "'Unable to resolve duplicate CURIE' for the individual CURIEs",
-            total_correction_count,
             total_unresolved_count,
-        )
-    else:
-        logger.info(
-            "CURIE duplicate cleanup applied %s correction(s), none unresolved",
-            total_correction_count,
         )
     return total_correction_count, total_unresolved_count
 
@@ -759,8 +767,12 @@ def _iter_duplicate_curies(data_folder: Union[str, Path]):
 
 
 def _curie_duplication_batch_handler(
-    task_id: int, curies: list[str], collection_name: str
+    task_id: int, curies: list[tuple[str, ...]], collection_name: str
 ) -> tuple[int, int, int]:
+    """
+    `curies` holds the sqlite rows streamed by `_iter_duplicate_curies`, so each
+    entry is a row tuple whose first column is the CURIE.
+    """
 
     num_retry = 10
     counter = 0

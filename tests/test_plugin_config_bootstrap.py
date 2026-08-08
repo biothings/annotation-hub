@@ -22,7 +22,6 @@ ordered ahead of the plugin imports.
 """
 
 import ast
-import importlib.util
 import os
 import subprocess
 import sys
@@ -35,20 +34,14 @@ REPOSITORY_ROOT = Path(__file__).parents[1]
 PLUGIN_ROOT = REPOSITORY_ROOT / "plugins"
 BOOTSTRAP_MODULE = "biothings.hub"
 
-
-def _bootstrap_module_installed() -> bool:
-    """
-    Report whether a real biothings[hub] install is importable.
-
-    `find_spec` locates the module without executing it -- importing
-    `biothings.hub` runs `_config_for_app()`, which reads a config module from
-    the working directory and opens the hub database, so it is not something to
-    do just to decide whether to skip.
-    """
-    try:
-        return importlib.util.find_spec(BOOTSTRAP_MODULE) is not None
-    except ModuleNotFoundError:
-        return False
+# The driver below reports an unusable environment with this code rather than
+# failing. `find_spec("biothings.hub")` cannot stand in for it: the `hub` extra
+# installs dependencies, not modules, so the module resolves in a base-only
+# install and then fails on a missing third-party import. Deciding from inside
+# the driver keeps the test required wherever it can actually run, and a missing
+# dependency can never be confused with the regression it guards -- that only
+# ever surfaces in the spawned child.
+ENVIRONMENT_UNUSABLE_EXIT_CODE = 77
 
 
 def _module_level_imports(source: str) -> list[str]:
@@ -119,13 +112,6 @@ def test_plugin_modules_still_read_config_at_import_time(plugin_name):
     )
 
 
-@pytest.mark.skipif(
-    not _bootstrap_module_installed(),
-    reason=(
-        f"needs a real {BOOTSTRAP_MODULE} install (requirements.txt) -- stubs "
-        "cannot show that importing it installs biothings.config"
-    ),
-)
 def test_spawned_nodenorm_worker_bootstraps_config_and_hub_db(tmp_path):
     config_module_name = "spawn_test_hub_config"
     sqlite_folder = tmp_path / "hubdb"
@@ -156,12 +142,15 @@ def test_spawned_nodenorm_worker_bootstraps_config_and_hub_db(tmp_path):
 
     driver = tmp_path / "spawn_driver.py"
     driver.write_text(
-        textwrap.dedent("""
+        textwrap.dedent(f"""
             import concurrent.futures
             import importlib
             import multiprocessing
             import os
+            import sys
             from pathlib import Path
+
+            ENVIRONMENT_UNUSABLE_EXIT_CODE = {ENVIRONMENT_UNUSABLE_EXIT_CODE}
 
 
             def allow_restricted_semaphore_query():
@@ -180,8 +169,14 @@ def test_spawned_nodenorm_worker_bootstraps_config_and_hub_db(tmp_path):
 
 
             def main():
-                import biothings.hub  # noqa: F401
-                from plugins.nodenorm.worker import _configure_sqlite_tmpdir
+                # Anything missing here is the environment, not the regression:
+                # the bootstrap under test only ever fails in the spawned child.
+                try:
+                    import biothings.hub  # noqa: F401
+                    from plugins.nodenorm.worker import _configure_sqlite_tmpdir
+                except ModuleNotFoundError as missing_dependency:
+                    print(f"unusable environment: {{missing_dependency}}")
+                    sys.exit(ENVIRONMENT_UNUSABLE_EXIT_CODE)
 
                 test_config = importlib.import_module(os.environ["HUB_CONFIG"])
                 allow_restricted_semaphore_query()
@@ -227,6 +222,12 @@ def test_spawned_nodenorm_worker_bootstraps_config_and_hub_db(tmp_path):
         timeout=45,
         check=False,
     )
+
+    if result.returncode == ENVIRONMENT_UNUSABLE_EXIT_CODE:
+        pytest.skip(
+            "needs biothings[hub] and the plugin's own dependencies installed "
+            f"(requirements.txt): {result.stdout.strip()}"
+        )
 
     assert result.returncode == 0, (
         "spawned NodeNorm worker failed to bootstrap Hub configuration:\n"
