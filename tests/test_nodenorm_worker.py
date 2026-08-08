@@ -41,9 +41,9 @@ def worker_module(monkeypatch, tmp_path):
 
     common_module.iter_n = iter_n
 
-    # worker.py imports pymongo at module scope. None of these tests exercise a
-    # pymongo object, so stub it the same way biothings is stubbed above rather
-    # than making the suite depend on a real install.
+    # worker.py imports pymongo at module scope. The tests exercise the operation
+    # values and collection behavior through the stateful fake below, so the
+    # module itself can stay independent of a real MongoDB installation.
     pymongo_module = types.ModuleType("pymongo")
     errors_module = types.ModuleType("pymongo.errors")
     collection_module = types.ModuleType("pymongo.collection")
@@ -119,6 +119,18 @@ class FakeBulkWriteResult:
         self.matched_count = matched_count
 
 
+class FakeMongoCursor:
+    def __init__(self, documents):
+        self.documents = documents
+
+    def __iter__(self):
+        return iter(self.documents)
+
+    def limit(self, count):
+        self.documents = self.documents[:count]
+        return self
+
+
 class FakeMongoCollection:
     """
     A stateful stand-in that applies filters and reports the counts MongoDB
@@ -136,15 +148,46 @@ class FakeMongoCollection:
         self.documents = [copy.deepcopy(document) for document in documents]
         self.bulk_write_calls = []
 
-    def find(self, query):
-        curie = query["identifiers.i"]
-        return iter(
-            [
+    def find(self, query, projection=None):
+        if "_id" in query:
+            document_ids = set(query["_id"]["$in"])
+            documents = [
+                copy.deepcopy(document)
+                for document in self.documents
+                if document["_id"] in document_ids
+            ]
+            if query.get("identifiers") == []:
+                documents = [
+                    document for document in documents if not document["identifiers"]
+                ]
+        else:
+            curie = query["identifiers.i"]
+            documents = [
                 copy.deepcopy(document)
                 for document in self.documents
                 if curie in [identifier["i"] for identifier in document["identifiers"]]
             ]
-        )
+        if projection is not None:
+            include_identifiers = (
+                "identifiers" in projection or "identifiers.i" in projection
+            )
+            documents = [
+                {
+                    "_id": document["_id"],
+                    **(
+                        {
+                            "identifiers": [
+                                {"i": identifier["i"]}
+                                for identifier in document["identifiers"]
+                            ]
+                        }
+                        if include_identifiers
+                        else {}
+                    ),
+                }
+                for document in documents
+            ]
+        return FakeMongoCursor(documents)
 
     def stored(self, document_id):
         for document in self.documents:
@@ -395,51 +438,21 @@ def test_peer_identifier_writer_drains_after_shared_failure(worker_module, monke
     assert connection.closed is True
 
 
-def test_duplicate_cleanup_failure_is_propagated_and_cancels_pending(
+def test_duplicate_cleanup_failure_is_propagated_before_later_batches(
     worker_module, monkeypatch
 ):
     cleanup_error = RuntimeError("duplicate cleanup failed")
+    handled_tasks = []
 
-    class FakeFuture:
-        def __init__(self, error=None, result=None):
-            self.error = error
-            self.value = result
-            self.cancelled = False
-
-        def result(self):
-            if self.error is not None:
-                raise self.error
-            return self.value
-
-        def cancel(self):
-            self.cancelled = True
-            return True
-
-    failed_future = FakeFuture(error=cleanup_error)
-    pending_future = FakeFuture(result=(1, 0, 0))
-
-    class FakeExecutor:
-        def __init__(self, **_kwargs):
-            self.futures = iter((failed_future, pending_future))
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def submit(self, *_args, **_kwargs):
-            return next(self.futures)
+    def fail_first_batch(task_id, curies, collection_name):
+        del curies, collection_name
+        handled_tasks.append(task_id)
+        raise cleanup_error
 
     monkeypatch.setattr(
-        worker_module.concurrent.futures,
-        "ThreadPoolExecutor",
-        FakeExecutor,
-    )
-    monkeypatch.setattr(
-        worker_module.concurrent.futures,
-        "as_completed",
-        lambda futures: iter(futures),
+        worker_module,
+        "_curie_duplication_batch_handler",
+        fail_first_batch,
     )
     monkeypatch.setattr(
         worker_module,
@@ -456,8 +469,232 @@ def test_duplicate_cleanup_failure_is_propagated_and_cancels_pending(
         worker_module.cleanup_curie_duplication("data", "collection")
 
     assert raised.value is cleanup_error
-    assert failed_future.cancelled is True
-    assert pending_future.cancelled is True
+    assert handled_tasks == [0]
+
+
+@pytest.mark.parametrize("validation_mode", ["report", "strict"])
+def test_clean_collection_is_validated_and_promoted(
+    worker_module, monkeypatch, validation_mode
+):
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "create_mongo_identifiers_index",
+        lambda collection: calls.append(("mongo-index", collection)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "create_identifiers_index",
+        lambda data: calls.append(("sqlite-index", data)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "cleanup_curie_duplication",
+        lambda data, collection: (
+            calls.append(("cleanup", data, collection)) or (2, 0)
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_curie_uniqueness",
+        lambda data, collection: (
+            calls.append(("validate", data, collection))
+            or worker_module.CurieValidationReport(0, 0, 0, 0, ())
+        ),
+    )
+
+    worker_module._prepare_collection_for_promotion(
+        "data", "collection", validation_mode=validation_mode
+    )
+
+    assert calls == [
+        ("mongo-index", "collection"),
+        ("sqlite-index", "data"),
+        ("cleanup", "data", "collection"),
+        ("validate", "data", "collection"),
+    ]
+
+
+def test_off_mode_cleans_without_running_uniqueness_audit(worker_module, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "create_mongo_identifiers_index",
+        lambda collection: calls.append(("mongo-index", collection)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "create_identifiers_index",
+        lambda data: calls.append(("sqlite-index", data)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "cleanup_curie_duplication",
+        lambda data, collection: (
+            calls.append(("cleanup", data, collection)) or (2, 0)
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_curie_uniqueness",
+        lambda _data, _collection: pytest.fail("off mode must not run the audit"),
+    )
+
+    worker_module._prepare_collection_for_promotion(
+        "data", "collection", validation_mode="off"
+    )
+
+    assert calls == [
+        ("mongo-index", "collection"),
+        ("sqlite-index", "data"),
+        ("cleanup", "data", "collection"),
+    ]
+
+
+def test_validation_mode_defaults_to_off(worker_module):
+    assert worker_module._curie_validation_mode() == "off"
+
+
+def test_strict_mode_blocks_a_reported_uniqueness_violation(worker_module, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "create_mongo_identifiers_index",
+        lambda collection: calls.append(("mongo-index", collection)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "create_identifiers_index",
+        lambda data: calls.append(("sqlite-index", data)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "cleanup_curie_duplication",
+        lambda data, collection: (
+            calls.append(("cleanup", data, collection)) or (0, 1)
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_curie_uniqueness",
+        lambda data, collection: (
+            calls.append(("validate", data, collection))
+            or worker_module.CurieValidationReport(
+                candidate_count=1,
+                missing_count=0,
+                multiple_document_count=1,
+                repeated_in_document_count=0,
+                samples=("'CURIE:x' (documents=at least 2)",),
+            )
+        ),
+    )
+
+    with pytest.raises(worker_module.NodeNormCollectionValidationError) as raised:
+        worker_module._prepare_collection_for_promotion(
+            "data", "collection", validation_mode="strict"
+        )
+
+    assert "1 violation(s)" in str(raised.value)
+    assert calls == [
+        ("mongo-index", "collection"),
+        ("sqlite-index", "data"),
+        ("cleanup", "data", "collection"),
+        ("validate", "data", "collection"),
+    ]
+
+
+def test_report_mode_allows_a_reported_uniqueness_violation(
+    worker_module, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        worker_module, "create_mongo_identifiers_index", lambda _collection: None
+    )
+    monkeypatch.setattr(worker_module, "create_identifiers_index", lambda _data: None)
+    monkeypatch.setattr(
+        worker_module,
+        "cleanup_curie_duplication",
+        lambda _data, _collection: (0, 1),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_curie_uniqueness",
+        lambda _data, _collection: worker_module.CurieValidationReport(
+            candidate_count=1,
+            missing_count=0,
+            multiple_document_count=1,
+            repeated_in_document_count=0,
+            samples=("'CURIE:x' (documents=at least 2)",),
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        worker_module._prepare_collection_for_promotion(
+            "data", "collection", validation_mode="report"
+        )
+
+    assert "Promotion remains allowed because validation mode is report" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("validation_mode", "should_raise"),
+    [
+        pytest.param("report", False, id="report-continues"),
+        pytest.param("strict", True, id="strict-blocks"),
+    ],
+)
+def test_exhausted_mongo_audit_is_nonblocking_only_in_report_mode(
+    worker_module, monkeypatch, validation_mode, should_raise
+):
+    monkeypatch.setattr(
+        worker_module, "create_mongo_identifiers_index", lambda _collection: None
+    )
+    monkeypatch.setattr(worker_module, "create_identifiers_index", lambda _data: None)
+    monkeypatch.setattr(
+        worker_module,
+        "cleanup_curie_duplication",
+        lambda _data, _collection: (0, 0),
+    )
+
+    monkeypatch.setattr(
+        worker_module,
+        "validate_curie_uniqueness",
+        lambda _data, _collection: worker_module.CurieValidationReport(
+            candidate_count=9_900_000,
+            missing_count=2,
+            multiple_document_count=3,
+            repeated_in_document_count=4,
+            samples=("partial sample",),
+            complete=False,
+        ),
+    )
+
+    if should_raise:
+        with pytest.raises(worker_module.NodeNormCollectionValidationError) as raised:
+            worker_module._prepare_collection_for_promotion(
+                "data", "collection", validation_mode=validation_mode
+            )
+        assert "Audit incomplete" in str(raised.value)
+    else:
+        worker_module._prepare_collection_for_promotion(
+            "data", "collection", validation_mode=validation_mode
+        )
+
+
+def test_invalid_validation_mode_fails_before_upload_work(worker_module, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        worker_module.config, "NODENORM_CURIE_VALIDATION_MODE", "typo", raising=False
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_configure_sqlite_tmpdir",
+        lambda: calls.append("configure-sqlite"),
+    )
+
+    with pytest.raises(ValueError, match="NODENORM_CURIE_VALIDATION_MODE"):
+        worker_module.upload_process("data", "collection")
+
+    assert calls == []
 
 
 def test_upload_raises_original_identifier_writer_error(worker_module, monkeypatch):
@@ -683,6 +920,110 @@ def test_colliding_curies_are_pulled_from_the_non_protein_document(
     assert collection.duplicated_curies() == set()
 
 
+def test_merged_protein_type_list_is_recognized(worker_module, monkeypatch):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document(
+                "protein",
+                "CURIE:shared",
+                "CURIE:p",
+                node_type=["biolink:Protein", "biolink:Gene"],
+            ),
+            identifier_document("side", "CURIE:shared", "CURIE:s"),
+        ],
+    )
+
+    assert run_batch(worker_module, ["CURIE:shared"]) == (0, 1, 0)
+    assert collection.curies("side") == ["CURIE:s"]
+    assert collection.duplicated_curies() == set()
+
+
+def test_pair_order_uses_unique_curie_count_not_repeated_entries(
+    worker_module, monkeypatch
+):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("a", "CURIE:x", "CURIE:x"),
+            identifier_document("b", "CURIE:x", "CURIE:y"),
+        ],
+    )
+
+    assert run_batch(worker_module, ["CURIE:x"]) == (0, 1, 0)
+    assert collection.stored("a") is None
+    assert collection.curies("b") == ["CURIE:x", "CURIE:y"]
+    assert collection.duplicated_curies() == set()
+
+
+def test_equal_curie_sets_prefer_deduplicated_survivor(worker_module, monkeypatch):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("a", "CURIE:x", "CURIE:x"),
+            identifier_document("z", "CURIE:x"),
+        ],
+    )
+
+    assert run_batch(worker_module, ["CURIE:x"]) == (0, 1, 0)
+    assert collection.stored("a") is None
+    assert collection.curies("z") == ["CURIE:x"]
+    assert collection.duplicated_curies() == set()
+
+
+def test_pair_repair_deduplicates_its_survivor(worker_module, monkeypatch):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("super", "CURIE:x", "CURIE:x", "CURIE:y"),
+            identifier_document("sub", "CURIE:x"),
+        ],
+    )
+
+    assert run_batch(worker_module, ["CURIE:x"]) == (0, 2, 0)
+    assert collection.curies("super") == ["CURIE:x", "CURIE:y"]
+    assert collection.stored("sub") is None
+    assert collection.duplicated_curies() == set()
+
+
+def test_protein_owns_shared_curie_when_it_is_the_smaller_clique(
+    worker_module, monkeypatch
+):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("protein", "CURIE:x", node_type="biolink:Protein"),
+            identifier_document("non-protein", "CURIE:x", "CURIE:y"),
+        ],
+    )
+
+    assert run_batch(worker_module, ["CURIE:x"]) == (0, 1, 0)
+    assert collection.curies("protein") == ["CURIE:x"]
+    assert collection.curies("non-protein") == ["CURIE:y"]
+    assert collection.duplicated_curies() == set()
+
+
+def test_protein_wins_equal_curie_set_tie(worker_module, monkeypatch):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("z-protein", "CURIE:x", node_type="biolink:Protein"),
+            identifier_document("a-non-protein", "CURIE:x"),
+        ],
+    )
+
+    assert run_batch(worker_module, ["CURIE:x"]) == (0, 1, 0)
+    assert collection.curies("z-protein") == ["CURIE:x"]
+    assert collection.stored("a-non-protein") is None
+    assert collection.duplicated_curies() == set()
+
+
 def test_two_shared_curies_report_one_correction(worker_module, monkeypatch):
     """
     Both CURIEs resolve to the same pair of documents, so the batch queues two
@@ -723,6 +1064,19 @@ def test_curie_repeated_within_a_document_is_trimmed(worker_module, monkeypatch)
     assert collection.duplicated_curies() == set()
 
 
+def test_multiple_repeated_curies_coalesce_to_one_trim(worker_module, monkeypatch):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [identifier_document("d1", "CURIE:x", "CURIE:x", "CURIE:y", "CURIE:y")],
+    )
+
+    assert run_batch(worker_module, ["CURIE:x", "CURIE:y"]) == (0, 1, 0)
+    assert collection.curies("d1") == ["CURIE:x", "CURIE:y"]
+    assert len(collection.bulk_write_calls[0]) == 1
+    assert collection.duplicated_curies() == set()
+
+
 def test_document_without_a_repeated_curie_is_not_counted_unresolved(
     worker_module, monkeypatch
 ):
@@ -749,8 +1103,9 @@ def test_trim_does_not_clobber_a_document_changed_underneath_it(
     different CURIE on the same document wins, and the trim applies nothing
     rather than reinstating the identifiers that worker removed.
 
-    A miss is reported unresolved rather than passing as resolved: nothing was
-    written, so anything still repeated in that document is still repeated.
+    The concurrent change has already removed the repeat. A CAS miss therefore
+    cannot by itself be called unresolved; the final collection validator checks
+    the resulting CURIE cardinality directly.
     """
     collection = install_fake_collection(
         worker_module,
@@ -759,15 +1114,17 @@ def test_trim_does_not_clobber_a_document_changed_underneath_it(
     )
     original_find = collection.find
 
-    def find_then_change(query):
-        documents = list(original_find(query))
+    def find_then_change(query, projection=None):
+        if "_id" in query:
+            return original_find(query, projection)
+        documents = list(original_find(query, projection))
         # simulate a concurrent repair landing between the read and the write
         collection.stored("d1")["identifiers"] = [{"i": "CURIE:dupe", "l": ""}]
         return iter(documents)
 
     monkeypatch.setattr(collection, "find", find_then_change)
 
-    assert run_batch(worker_module, ["CURIE:dupe"]) == (0, 0, 1)
+    assert run_batch(worker_module, ["CURIE:dupe"]) == (0, 0, 0)
     assert collection.curies("d1") == ["CURIE:dupe"]
 
 
@@ -802,6 +1159,32 @@ def test_composed_pulls_never_empty_a_document(worker_module, monkeypatch):
     assert len(collection.bulk_write_calls[0]) == 2, "two pulls were issued"
 
 
+def test_repair_rejects_an_emptied_surviving_document(worker_module, monkeypatch):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document(
+                "protein", "CURIE:x", "CURIE:p", node_type="biolink:Protein"
+            ),
+            identifier_document("side", "CURIE:x", "CURIE:side"),
+        ],
+    )
+    actual_bulk_write = collection.bulk_write
+
+    def bulk_write_then_corrupt(requests):
+        result = actual_bulk_write(requests)
+        collection.stored("side")["identifiers"] = []
+        return result
+
+    monkeypatch.setattr(collection, "bulk_write", bulk_write_then_corrupt)
+
+    with pytest.raises(worker_module.NodeNormCollectionValidationError) as raised:
+        run_batch(worker_module, ["CURIE:x"])
+
+    assert "document(s) with no identifiers" in str(raised.value)
+
+
 def test_equal_documents_do_not_delete_each_other(worker_module, monkeypatch):
     """
     Two documents with identical CURIE sets, where find() returns them in opposite
@@ -823,8 +1206,10 @@ def test_equal_documents_do_not_delete_each_other(worker_module, monkeypatch):
     )
     unsorted_find = collection.find
 
-    def find_in_opposite_orders(query):
-        documents = list(unsorted_find(query))
+    def find_in_opposite_orders(query, projection=None):
+        if "_id" in query:
+            return unsorted_find(query, projection)
+        documents = list(unsorted_find(query, projection))
         if query["identifiers.i"] == "CURIE:y":
             documents.reverse()
         return iter(documents)
@@ -857,17 +1242,19 @@ def test_stale_subset_delete_from_another_worker_applies_once(
         ],
     )
     stale_documents = [copy.deepcopy(document) for document in collection.documents]
+    current_find = collection.find
 
     # first worker resolves CURIE:x and its delete lands
     assert run_batch(worker_module, ["CURIE:x"]) == (0, 1, 0)
     assert collection.stored("drop") is None
 
     # second worker resolves CURIE:y from the snapshot it read beforehand
-    monkeypatch.setattr(
-        collection,
-        "find",
-        lambda _query: iter([copy.deepcopy(d) for d in stale_documents]),
-    )
+    def find_stale_pair(query, projection=None):
+        if "_id" in query:
+            return current_find(query, projection)
+        return iter([copy.deepcopy(d) for d in stale_documents])
+
+    monkeypatch.setattr(collection, "find", find_stale_pair)
 
     task_id, corrections, unresolved = run_batch(worker_module, ["CURIE:y"], task_id=1)
 
@@ -875,9 +1262,102 @@ def test_stale_subset_delete_from_another_worker_applies_once(
     assert [document["_id"] for document in collection.documents] == ["keep"]
 
 
-def test_pull_that_would_empty_a_document_is_left_unresolved(
-    worker_module, monkeypatch
-):
+def test_serial_cleanup_prevents_subset_owner_reversal(worker_module, monkeypatch):
+    """
+    A delayed subset delete can become unsafe after another repair shrinks its
+    keeper and reverses the later ownership decision. Cleanup therefore completes
+    each batch before the next one reads the temporary collection.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("z-keeper", "CURIE:x", "CURIE:y", "CURIE:z"),
+            identifier_document("a-subset", "CURIE:x", "CURIE:y"),
+            identifier_document(
+                "protein", "CURIE:z", "CURIE:p", node_type="biolink:Protein"
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        lambda _data_folder: iter((("CURIE:x",), ("CURIE:z",), ("CURIE:y",))),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "iter_n",
+        lambda identifiers, _size: ([identifier] for identifier in identifiers),
+    )
+
+    assert worker_module.cleanup_curie_duplication("data", "collection") == (2, 0)
+    assert collection.curies("z-keeper") == ["CURIE:x", "CURIE:y"]
+    assert collection.stored("a-subset") is None
+    assert collection.curies("protein") == ["CURIE:z", "CURIE:p"]
+    assert collection.duplicated_curies() == set()
+
+
+def test_serial_cleanup_prevents_pull_owner_reversal(worker_module, monkeypatch):
+    """
+    Mutable identifier counts can also make two stale Protein-pair decisions pull
+    the same CURIEs from opposite documents. Serial batches keep one ownership
+    decision visible to every later read.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document(
+                "z-a",
+                "CURIE:x",
+                "CURIE:y",
+                "CURIE:z",
+                "CURIE:a-only",
+                node_type="biolink:Protein",
+            ),
+            identifier_document(
+                "a-b",
+                "CURIE:x",
+                "CURIE:y",
+                "CURIE:b-only",
+                node_type="biolink:Protein",
+            ),
+            identifier_document(
+                "c",
+                "CURIE:z",
+                "CURIE:c1",
+                "CURIE:c2",
+                "CURIE:c3",
+                "CURIE:c4",
+                node_type="biolink:Protein",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        lambda _data_folder: iter((("CURIE:x",), ("CURIE:z",), ("CURIE:y",))),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "iter_n",
+        lambda identifiers, _size: ([identifier] for identifier in identifiers),
+    )
+
+    assert worker_module.cleanup_curie_duplication("data", "collection") == (2, 0)
+    assert collection.curies("z-a") == ["CURIE:x", "CURIE:y", "CURIE:a-only"]
+    assert collection.curies("a-b") == ["CURIE:b-only"]
+    assert collection.curies("c") == [
+        "CURIE:z",
+        "CURIE:c1",
+        "CURIE:c2",
+        "CURIE:c3",
+        "CURIE:c4",
+    ]
+    assert collection.duplicated_curies() == set()
+
+
+def test_repeated_subset_is_deleted_instead_of_pulled_empty(worker_module, monkeypatch):
     collection = install_fake_collection(
         worker_module,
         monkeypatch,
@@ -891,8 +1371,188 @@ def test_pull_that_would_empty_a_document_is_left_unresolved(
         ],
     )
 
-    assert run_batch(worker_module, ["CURIE:shared"]) == (0, 0, 1)
-    assert collection.bulk_write_calls == []
+    assert run_batch(worker_module, ["CURIE:shared"]) == (0, 1, 0)
+    assert collection.stored("small-molecule") is None
+    assert collection.duplicated_curies() == set()
+
+
+def test_curie_validation_accepts_exactly_one_occurrence_per_candidate(
+    worker_module, monkeypatch
+):
+    candidate_curies = [f"CURIE:{index}" for index in range(9)]
+    install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [identifier_document("d1", *candidate_curies, "CURIE:other")],
+    )
+    monkeypatch.setattr(worker_module, "NODENORM_VALIDATION_BATCH_SIZE", 1)
+    monkeypatch.setattr(worker_module, "NODENORM_WORKER_COUNT", 2)
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        lambda _data_folder: iter((curie,) for curie in candidate_curies),
+    )
+
+    # Nine one-row batches exceed the four-batch (2 * workers) initial window,
+    # exercising both bounded prefill and replenishment.
+    report = worker_module.validate_curie_uniqueness("data", "collection")
+    assert report == worker_module.CurieValidationReport(9, 0, 0, 0, ())
+
+
+def test_curie_validation_reports_missing_split_and_repeated_candidates(
+    worker_module, monkeypatch
+):
+    install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("y1", "CURIE:split"),
+            identifier_document("y2", "CURIE:split"),
+            identifier_document("z", "CURIE:repeat", "CURIE:repeat"),
+        ],
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        lambda _data_folder: iter(
+            (("CURIE:missing",), ("CURIE:split",), ("CURIE:repeat",))
+        ),
+    )
+    monkeypatch.setattr(worker_module, "NODENORM_VALIDATION_BATCH_SIZE", 1)
+
+    report = worker_module.validate_curie_uniqueness("data", "collection")
+    assert report.candidate_count == 3
+    assert report.missing_count == 1
+    assert report.multiple_document_count == 1
+    assert report.repeated_in_document_count == 1
+
+    message = report.failure_message()
+    assert "3 violation(s) among 3 processed candidate CURIE(s)" in message
+    assert "missing=1" in message
+    assert "multiple-documents=1" in message
+    assert "repeated-in-document=1" in message
+    assert "CURIE:missing" in message
+    assert "CURIE:split" in message
+    assert "CURIE:repeat" in message
+
+
+def test_curie_validation_stops_queued_batches_after_query_failure(
+    worker_module, monkeypatch
+):
+    collection = install_fake_collection(worker_module, monkeypatch)
+    queried_curies = []
+    yielded_curies = []
+    mongo_error = RuntimeError("MongoDB query failed")
+
+    def fail_first_query(query, _projection=None):
+        duplicate_curie = query["identifiers.i"]
+        queried_curies.append(duplicate_curie)
+        if duplicate_curie == "CURIE:boom":
+            raise mongo_error
+        return FakeMongoCursor([])
+
+    monkeypatch.setattr(collection, "find", fail_first_query)
+    monkeypatch.setattr(worker_module, "NODENORM_VALIDATION_BATCH_SIZE", 1)
+    monkeypatch.setattr(worker_module, "NODENORM_WORKER_COUNT", 1)
+
+    def duplicate_rows(_data_folder):
+        for duplicate_curie in (
+            "CURIE:boom",
+            "CURIE:queued",
+            "CURIE:not-submitted",
+        ):
+            yielded_curies.append(duplicate_curie)
+            yield (duplicate_curie,)
+
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        duplicate_rows,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        worker_module.validate_curie_uniqueness("data", "collection")
+
+    assert raised.value is mongo_error
+    assert queried_curies == ["CURIE:boom"]
+    assert yielded_curies[0] == "CURIE:boom"
+    assert "CURIE:not-submitted" not in yielded_curies
+
+
+def test_curie_validation_retries_transient_mongo_timeout(worker_module, monkeypatch):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [identifier_document("d1", "CURIE:x")],
+    )
+    original_find = collection.find
+    attempts = []
+
+    def transient_find(query, projection=None):
+        attempts.append(query["identifiers.i"])
+        if len(attempts) < 3:
+            raise worker_module.pymongo.errors.ServerSelectionTimeoutError(
+                "temporary MongoDB contention"
+            )
+        return original_find(query, projection)
+
+    monkeypatch.setattr(collection, "find", transient_find)
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        lambda _data_folder: iter((("CURIE:x",),)),
+    )
+    monkeypatch.setattr(worker_module, "NODENORM_VALIDATION_MONGO_ATTEMPTS", 3)
+
+    report = worker_module.validate_curie_uniqueness("data", "collection")
+
+    assert report.violation_count == 0
+    assert attempts == ["CURIE:x", "CURIE:x", "CURIE:x"]
+
+
+def test_curie_validation_returns_incomplete_report_after_mongo_exhaustion(
+    worker_module, monkeypatch
+):
+    collection = install_fake_collection(worker_module, monkeypatch)
+    attempts = []
+
+    def unavailable_find(query, _projection=None):
+        attempts.append(query["identifiers.i"])
+        raise worker_module.pymongo.errors.ServerSelectionTimeoutError(
+            "MongoDB unavailable"
+        )
+
+    monkeypatch.setattr(collection, "find", unavailable_find)
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        lambda _data_folder: iter((("CURIE:x",),)),
+    )
+    monkeypatch.setattr(worker_module, "NODENORM_VALIDATION_MONGO_ATTEMPTS", 3)
+
+    report = worker_module.validate_curie_uniqueness("data", "collection")
+
+    assert report.complete is False
+    assert report.candidate_count == 0
+    assert "Audit incomplete" in report.failure_message()
+    assert attempts == ["CURIE:x", "CURIE:x", "CURIE:x"]
+
+
+def test_curie_validation_bounds_failure_examples(worker_module, monkeypatch):
+    install_fake_collection(worker_module, monkeypatch)
+    monkeypatch.setattr(worker_module, "NODENORM_VALIDATION_FAILURE_SAMPLE_SIZE", 2)
+    monkeypatch.setattr(
+        worker_module,
+        "_iter_duplicate_curies",
+        lambda _data_folder: iter((("CURIE:one",), ("CURIE:two",), ("CURIE:three",))),
+    )
+
+    report = worker_module.validate_curie_uniqueness("data", "collection")
+    message = report.failure_message()
+    assert "3 violation(s) among 3 processed candidate CURIE(s)" in message
+    assert "CURIE:one" in message
+    assert "CURIE:two" in message
+    assert "CURIE:three" not in message
 
 
 def test_duplicate_cleanup_aggregates_and_returns_unresolved_totals(
