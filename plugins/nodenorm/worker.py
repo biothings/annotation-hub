@@ -1,5 +1,4 @@
 import concurrent.futures
-import copy
 import hashlib
 import itertools
 import json
@@ -10,7 +9,6 @@ import sqlite3
 import threading
 import time
 import zlib
-from collections import defaultdict
 from pathlib import Path
 from typing import Union
 
@@ -766,12 +764,179 @@ def _iter_duplicate_curies(data_folder: Union[str, Path]):
             identifier_connection.close()
 
 
+def _identifier_curies(document: dict) -> list[str]:
+    """
+    The CURIEs of a document's identifiers, in order, repeats included.
+
+    Comparisons must be made on the CURIE. Comparing whole identifier
+    dictionaries makes a CURIE shared with a different label or description look
+    like two unrelated identifiers, which is precisely the duplication this
+    cleanup exists to remove.
+    """
+    return [identifier["i"] for identifier in document["identifiers"]]
+
+
+def _deduplicate_document_identifiers(
+    task_id: int, document: dict
+) -> tuple[Union[object, None], bool]:
+    """
+    Trim repeated CURIEs from a single document, keeping the first occurrence.
+
+    Returns the operation to apply, or None, plus whether the CURIE was left
+    unresolved. Finding nothing to trim is a resolution, not a failure: the
+    shard counters record how often a CURIE was seen during upload, so a CURIE
+    counted twice can legitimately end up in one document once the duplicate
+    `_id` documents were merged.
+
+    The filter pins the identifier array this decision was made from, so a
+    document another worker has since changed is left alone instead of being
+    clobbered. A miss applies nothing and is visible in the batch's applied
+    count.
+    """
+    identifiers = document["identifiers"]
+    seen_curies = set()
+    deduplicated = []
+    for identifier in identifiers:
+        if identifier["i"] in seen_curies:
+            continue
+        seen_curies.add(identifier["i"])
+        deduplicated.append(identifier)
+
+    if len(deduplicated) == len(identifiers):
+        logger.debug(
+            "[Task %d] Document %s holds no repeated CURIE; nothing to trim",
+            task_id,
+            document["_id"],
+        )
+        return None, False
+
+    logger.debug(
+        "[Task %d] Trim %d repeated identifier(s) from document %s",
+        task_id,
+        len(identifiers) - len(deduplicated),
+        document["_id"],
+    )
+    return (
+        pymongo.UpdateOne(
+            {"_id": document["_id"], "identifiers": identifiers},
+            {"$set": {"identifiers": deduplicated}},
+        ),
+        False,
+    )
+
+
+def _evaluate_document_subset(
+    task_id: int, more_identifiers_doc: dict, less_identifiers_doc: dict
+):
+    """
+    If every CURIE of one document is also in the other we can drop it and keep
+    the other, which covers the whole document. Anything short of that needs the
+    intersection analysis below.
+    """
+    if not set(_identifier_curies(less_identifiers_doc)) <= set(
+        _identifier_curies(more_identifiers_doc)
+    ):
+        return None
+
+    logger.debug(
+        "[Task %d] Delete document %s, a CURIE subset of %s",
+        task_id,
+        less_identifiers_doc["_id"],
+        more_identifiers_doc["_id"],
+    )
+    return pymongo.DeleteOne({"_id": less_identifiers_doc["_id"]})
+
+
+def _evaluate_document_intersection(
+    task_id: int, more_identifiers_doc: dict, less_identifiers_doc: dict
+):
+    """
+    One crucial assumption here is that at least one of these documents has a
+    type of biolink:Protein.
+
+    If the type biolink:Protein isn't found then we cannot make any assumptions
+    about how to handle the intersection between the two documents.
+
+    The colliding CURIEs are pulled from the non-Protein document by CURIE rather
+    than by rewriting its identifier array, so concurrent repairs of other CURIEs
+    on the same document compose instead of overwriting one another, and pulling
+    the same CURIE twice is harmless.
+    """
+    document_types = (more_identifiers_doc["type"], less_identifiers_doc["type"])
+    if "biolink:Protein" not in document_types:
+        return None
+
+    if more_identifiers_doc["type"] == "biolink:Protein":
+        main_document = more_identifiers_doc
+        side_document = less_identifiers_doc
+    else:
+        main_document = less_identifiers_doc
+        side_document = more_identifiers_doc
+
+    main_curies = set(_identifier_curies(main_document))
+    side_curies = _identifier_curies(side_document)
+    colliding_curies = sorted({curie for curie in side_curies if curie in main_curies})
+    remaining_curies = [curie for curie in side_curies if curie not in main_curies]
+
+    # Removing every identifier would leave a document that identifies nothing,
+    # so leave the pair for a strategy that can account for it
+    if not colliding_curies or not remaining_curies:
+        return None
+
+    logger.debug(
+        "[Task %d] Pull %d colliding CURIE(s) from document %s, keeping them on "
+        "the biolink:Protein document %s",
+        task_id,
+        len(colliding_curies),
+        side_document["_id"],
+        main_document["_id"],
+    )
+    return pymongo.UpdateOne(
+        {"_id": side_document["_id"]},
+        {"$pull": {"identifiers": {"i": {"$in": colliding_curies}}}},
+    )
+
+
+def _resolve_document_pair(
+    task_id: int, documents: list[dict], duplicate_curie: str
+) -> tuple[Union[object, None], bool]:
+    if len(documents[0]["identifiers"]) > len(documents[1]["identifiers"]):
+        more_identifiers_doc = documents[0]
+        less_identifiers_doc = documents[1]
+    else:
+        more_identifiers_doc = documents[1]
+        less_identifiers_doc = documents[0]
+
+    operation = _evaluate_document_subset(
+        task_id, more_identifiers_doc, less_identifiers_doc
+    )
+    if operation is None:
+        operation = _evaluate_document_intersection(
+            task_id, more_identifiers_doc, less_identifiers_doc
+        )
+
+    if operation is None:
+        logger.critical(
+            "[Task %d] Unable to resolve duplicate CURIE %s: neither the subset "
+            "nor the intersection of the 2 documents sharing it can be evaluated",
+            task_id,
+            duplicate_curie,
+        )
+        return None, True
+    return operation, False
+
+
 def _curie_duplication_batch_handler(
     task_id: int, curies: list[tuple[str, ...]], collection_name: str
 ) -> tuple[int, int, int]:
     """
     `curies` holds the sqlite rows streamed by `_iter_duplicate_curies`, so each
     entry is a row tuple whose first column is the CURIE.
+
+    Returns the number of documents MongoDB reports as changed and the number of
+    CURIEs no strategy could resolve. The corrections figure comes from the write
+    result rather than the size of the request buffer, because two CURIEs shared
+    by the same pair of documents queue two requests that apply once.
     """
 
     num_retry = 10
@@ -804,177 +969,27 @@ def _curie_duplication_batch_handler(
     buffer = []
     unresolved_count = 0
     for result in curies:
-        # Named distinctly from the identifier documents iterated below, which
+        # Named distinctly from the identifier documents inspected below, which
         # otherwise shadow it
         duplicate_curie = result[0]
 
-        cursor = collection.find({"identifiers.i": duplicate_curie})
-        documents = list(cursor)
+        documents = list(collection.find({"identifiers.i": duplicate_curie}))
 
         # Handle case where the identifier.i is duplicated within the same document
         if len(documents) == 1:
-
-            # We need to generate every comparison within the same document. itertools.combinations
-            # produces every combination, but we need to store it on a per identifier level so we
-            # can determine if any of the identifiers match any of the others. This is the goal
-            # behind the comparison matrix we build to make every inner comparison possible
-            identifier_combinations = tuple(
-                itertools.combinations(documents[0]["identifiers"], 2)
+            operation, unresolved = _deduplicate_document_identifiers(
+                task_id, documents[0]
             )
-
-            comparison_matrix = defaultdict(list)
-            for index, identifier in enumerate(documents[0]["identifiers"]):
-                comparison_filter = [
-                    identifier in entry for entry in identifier_combinations
-                ]
-                comparison_matrix[index] = tuple(
-                    itertools.compress(identifier_combinations, comparison_filter)
-                )
-
-            removal_index = []
-            for index, comparisons in comparison_matrix.items():
-                removal_index.append(
-                    not all(
-                        identifier_group[0] == identifier_group[1]
-                        for identifier_group in comparisons
-                    )
-                )
-
-            # Skipping document as we likely already merged this earlier with duplicate _id merging
-            if all(removal_index) or (
-                not any(removal_index) and len(removal_index) == 1
-            ):
-                logger.debug(
-                    "[Task %d] Ignore 1 document due to initial upload BulkWriteError caught duplicate _id. Likely identical documents merged on the type field: %s",
-                    task_id,
-                    documents[0],
-                )
-            elif not any(removal_index) and len(removal_index) > 1:
-                original_document = copy.deepcopy(documents[0])
-                documents[0]["identifiers"] = [documents[0]["identifiers"][0]]
-
-                buffer.append(pymongo.ReplaceOne(original_document, documents[0]))
-                logger.debug(
-                    "[Task %d] Replace 1 document to trim all identifiers except the first due to them all being identical: %s",
-                    task_id,
-                    documents[0],
-                )
-            else:
-                original_document = copy.deepcopy(documents[0])
-                documents[0]["identifiers"] = list(
-                    itertools.compress(documents[0]["identifiers"], removal_index)
-                )
-                buffer.append(pymongo.ReplaceOne(original_document, documents[0]))
-                logger.debug(
-                    "[Task %d] Replace 1 document to trim some duplicate identifiers: %s",
-                    task_id,
-                    documents[0],
-                )
-
         # Handle case where the identifier.i is spread across 2 documents
         elif len(documents) == 2:
-
-            def _evaluate_document_subset(
-                more_identifiers_doc: dict, less_identifiers_doc: dict
-            ) -> pymongo.DeleteOne:
-                """
-                If it passes the subset check, then we can safely delete the document while keeping
-                the other document. It must be a complete subset, otherwise we have to perform
-                additional analysis to determine where the interesection exists between the two
-                documents
-                """
-                subset_check = []
-                for subset_identifier in less_identifiers_doc["identifiers"]:
-                    subset_check.append(
-                        subset_identifier in more_identifiers_doc["identifiers"]
-                    )
-
-                operation = None
-                if all(subset_check):
-                    operation = pymongo.DeleteOne(less_identifiers_doc)
-                    logger.debug(
-                        "[Task %d] Delete 1 document: %s", task_id, less_identifiers_doc
-                    )
-                return operation
-
-            def _evaluate_document_intersection(
-                more_identifiers_doc: dict, less_identifiers_doc: dict
-            ):
-                """
-                One crucial assumption here is that at least one of these documents is has a type of
-                biolink:Protein.
-
-                If the type biolink:Protein isn't found then we cannot make any assumptions about
-                how to handle the intersection between the two documents
-                """
-                operation = None
-                if (
-                    more_identifiers_doc["type"] == "biolink:Protein"
-                    or less_identifiers_doc["type"] == "biolink:Protein"
-                ):
-                    if more_identifiers_doc["type"] == "biolink:Protein":
-                        main_document = more_identifiers_doc
-                        side_document = less_identifiers_doc
-                    else:
-                        main_document = less_identifiers_doc
-                        side_document = more_identifiers_doc
-
-                    subset_mask = []
-                    for subset_identifier in side_document["identifiers"]:
-                        subset_mask.append(
-                            subset_identifier not in main_document["identifiers"]
-                        )
-
-                    if any(subset_mask):
-                        original_document = copy.deepcopy(side_document)
-                        side_document["identifiers"] = list(
-                            itertools.compress(
-                                side_document["identifiers"], subset_mask
-                            )
-                        )
-                        operation = pymongo.ReplaceOne(original_document, side_document)
-                        logger.debug(
-                            "[Task %d] Replace 1 document to trim the intersection of identifiers with another document: %s",
-                            task_id,
-                            side_document,
-                        )
-                return operation
-
-            operation = None
-            more_identifiers_doc = None
-            less_identifiers_doc = None
-            if len(documents[0]["identifiers"]) > len(documents[1]["identifiers"]):
-                more_identifiers_doc = documents[0]
-                less_identifiers_doc = documents[1]
-            else:
-                more_identifiers_doc = documents[1]
-                less_identifiers_doc = documents[0]
-
-            operation = _evaluate_document_subset(
-                more_identifiers_doc, less_identifiers_doc
+            operation, unresolved = _resolve_document_pair(
+                task_id, documents, duplicate_curie
             )
-            if operation is None:
-                operation = _evaluate_document_intersection(
-                    more_identifiers_doc, less_identifiers_doc
-                )
-
-            if operation is None:
-                unresolved_count += 1
-                logger.critical(
-                    "[Task %d] Unable to resolve duplicate CURIE %s: neither the "
-                    "subset nor the intersection of the 2 documents sharing it "
-                    "can be evaluated",
-                    task_id,
-                    duplicate_curie,
-                )
-            else:
-                buffer.append(operation)
-
         # A CURIE the identifier shards counted more than once should be found in
         # 1 or 2 documents. Anything else is outside what the branches above can
         # reason about, so leave the documents as they are and report it.
         else:
-            unresolved_count += 1
+            operation, unresolved = None, True
             logger.critical(
                 "[Task %d] Unable to resolve duplicate CURIE %s: found in %d "
                 "document(s), expected 1 or 2",
@@ -983,14 +998,34 @@ def _curie_duplication_batch_handler(
                 len(documents),
             )
 
-    if len(buffer) > 0:
+        if unresolved:
+            unresolved_count += 1
+        elif operation is not None:
+            buffer.append(operation)
+
+    if len(buffer) == 0:
         logger.debug(
-            "[Task %d] Bulk writing %s changes to collection", task_id, len(buffer)
+            "[Task %d] Bulk writing found no changes to collection to apply", task_id
         )
-        collection.bulk_write(buffer)
-        return task_id, len(buffer), unresolved_count
+        return task_id, 0, unresolved_count
 
     logger.debug(
-        "[Task %d] Bulk writing found no changes to collection to apply", task_id
+        "[Task %d] Bulk writing %s changes to collection", task_id, len(buffer)
     )
-    return task_id, 0, unresolved_count
+    write_result = collection.bulk_write(buffer)
+    correction_count = write_result.deleted_count + write_result.modified_count
+
+    # Requests that applied nothing are expected: the operations are idempotent so
+    # that concurrent workers compose, and a CURIE already repaired by way of
+    # another CURIE on the same document applies once. A shortfall is worth
+    # surfacing anyway, since it also covers a trim whose document changed
+    # underneath it.
+    if correction_count < len(buffer):
+        logger.debug(
+            "[Task %d] %d of %d write request(s) applied; the rest were already "
+            "satisfied or their document changed underneath them",
+            task_id,
+            correction_count,
+            len(buffer),
+        )
+    return task_id, correction_count, unresolved_count

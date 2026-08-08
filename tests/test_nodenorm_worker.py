@@ -112,22 +112,110 @@ def worker_module(monkeypatch, tmp_path):
     return module
 
 
+class FakeBulkWriteResult:
+    def __init__(self, deleted_count, modified_count):
+        self.deleted_count = deleted_count
+        self.modified_count = modified_count
+
+
 class FakeMongoCollection:
-    def __init__(self, documents_by_curie=None):
-        self.documents_by_curie = documents_by_curie or {}
+    """
+    A stateful stand-in that applies filters and reports the counts MongoDB
+    would, so tests can assert on effects rather than on requests issued.
+
+    It supports exactly the operations the cleanup emits: DeleteOne by `_id`, a
+    compare-and-swap `$set` of the identifier array, and `$pull` by identifier
+    CURIE. An update whose result equals the stored value reports no
+    modification, as MongoDB does -- that is what makes a no-op write visible.
+    Anything else raises, so a new kind of operation cannot silently go
+    unverified.
+    """
+
+    def __init__(self, documents=()):
+        self.documents = [copy.deepcopy(document) for document in documents]
         self.bulk_write_calls = []
 
     def find(self, query):
-        # deepcopy so the handler mutating documents cannot alter the fixture
-        documents = self.documents_by_curie.get(query["identifiers.i"], [])
-        return iter(copy.deepcopy(documents))
+        curie = query["identifiers.i"]
+        return iter(
+            [
+                copy.deepcopy(document)
+                for document in self.documents
+                if curie in [identifier["i"] for identifier in document["identifiers"]]
+            ]
+        )
+
+    def stored(self, document_id):
+        for document in self.documents:
+            if document["_id"] == document_id:
+                return document
+        return None
+
+    def curies(self, document_id):
+        document = self.stored(document_id)
+        return None if document is None else [i["i"] for i in document["identifiers"]]
+
+    def duplicated_curies(self):
+        """
+        Every CURIE that still resolves to more than one entry, whether repeated
+        inside one document or spread across two. This is the 1-1 identifiers.i
+        mapping the Elasticsearch terms query depends on.
+        """
+        counts = {}
+        for document in self.documents:
+            for identifier in document["identifiers"]:
+                counts[identifier["i"]] = counts.get(identifier["i"], 0) + 1
+        return {curie for curie, count in counts.items() if count > 1}
 
     def bulk_write(self, requests):
         self.bulk_write_calls.append(list(requests))
+        deleted_count = 0
+        modified_count = 0
+        for request in requests:
+            request_kind = type(request).__name__
+            if request_kind == "DeleteOne":
+                (query,) = request.arguments
+                document = self.stored(query["_id"])
+                if document is not None:
+                    self.documents.remove(document)
+                    deleted_count += 1
+                continue
+
+            assert request_kind == "UpdateOne", f"unsupported request {request_kind}"
+            query, update = request.arguments
+            document = self.stored(query["_id"])
+            if document is None:
+                continue
+            # compare-and-swap guard: a document changed since it was read no
+            # longer matches, so the update applies to nothing
+            if (
+                "identifiers" in query
+                and query["identifiers"] != document["identifiers"]
+            ):
+                continue
+
+            if "$set" in update:
+                replacement = update["$set"]["identifiers"]
+            elif "$pull" in update:
+                removed = set(update["$pull"]["identifiers"]["i"]["$in"])
+                replacement = [
+                    identifier
+                    for identifier in document["identifiers"]
+                    if identifier["i"] not in removed
+                ]
+            else:
+                raise AssertionError(f"unsupported update {update}")
+
+            if replacement == document["identifiers"]:
+                continue
+            document["identifiers"] = copy.deepcopy(replacement)
+            modified_count += 1
+
+        return FakeBulkWriteResult(deleted_count, modified_count)
 
 
-def install_fake_collection(worker_module, monkeypatch, documents_by_curie=None):
-    collection = FakeMongoCollection(documents_by_curie)
+def install_fake_collection(worker_module, monkeypatch, documents=()):
+    collection = FakeMongoCollection(documents)
     monkeypatch.setattr(
         worker_module.pymongo.collection,
         "Collection",
@@ -136,10 +224,12 @@ def install_fake_collection(worker_module, monkeypatch, documents_by_curie=None)
     return collection
 
 
-def identifier_document(curie, *other_curies, node_type="biolink:Disease"):
+def identifier_document(document_id, *curies, node_type="biolink:Disease", labels=None):
+    labels = labels or {}
     return {
+        "_id": document_id,
         "type": node_type,
-        "identifiers": [{"i": curie}] + [{"i": other} for other in other_curies],
+        "identifiers": [{"i": curie, "l": labels.get(curie, "")} for curie in curies],
     }
 
 
@@ -468,37 +558,36 @@ def test_upload_raises_original_identifier_writer_error(worker_module, monkeypat
     assert post_upload_calls == []
 
 
+def run_batch(worker_module, curies, task_id=0):
+    return worker_module._curie_duplication_batch_handler(
+        task_id=task_id,
+        curies=[(curie,) for curie in curies],
+        collection_name="collection",
+    )
+
+
 def test_unresolvable_curie_pair_is_counted_not_written(worker_module, monkeypatch):
     """
-    Two documents share a CURIE, neither identifier list is a subset of the
-    other, and neither is biolink:Protein -- so both evaluators return None. The
-    operation must not reach the buffer: pymongo rejects None with
-    "None is not a valid request", which would fail the whole batch and discard
-    the corrections that were computed successfully.
+    Two documents share a CURIE, neither CURIE set is a subset of the other, and
+    neither is biolink:Protein -- so no strategy applies. Nothing may be written:
+    pymongo rejects None with "None is not a valid request", which would fail the
+    whole batch and discard the corrections computed successfully.
     """
     collection = install_fake_collection(
         worker_module,
         monkeypatch,
-        {
-            "CURIE:shared": [
-                identifier_document("CURIE:shared", "CURIE:a"),
-                identifier_document(
-                    "CURIE:shared", "CURIE:b", node_type="biolink:Gene"
-                ),
-            ]
-        },
+        [
+            identifier_document("d1", "CURIE:shared", "CURIE:a"),
+            identifier_document(
+                "d2", "CURIE:shared", "CURIE:b", node_type="biolink:Gene"
+            ),
+        ],
     )
 
-    task_id, num_corrections, num_unresolved = (
-        worker_module._curie_duplication_batch_handler(
-            task_id=7,
-            curies=[("CURIE:shared",)],
-            collection_name="collection",
-        )
-    )
-
-    assert (task_id, num_corrections, num_unresolved) == (7, 0, 1)
+    assert run_batch(worker_module, ["CURIE:shared"], task_id=7) == (7, 0, 1)
     assert collection.bulk_write_calls == []
+    assert collection.curies("d1") == ["CURIE:shared", "CURIE:a"]
+    assert collection.curies("d2") == ["CURIE:shared", "CURIE:b"]
 
 
 @pytest.mark.parametrize(
@@ -511,67 +600,179 @@ def test_unexpected_document_count_is_counted_not_ignored(
     """
     The identifier shards only record CURIEs seen more than once, so a CURIE
     resolving to 0 or 3+ documents is outside what the handler can reason about.
-    Neither branch matches, so it used to be dropped with no log at all.
+    Neither branch matched, so it used to be dropped with no log at all.
     """
     collection = install_fake_collection(
         worker_module,
         monkeypatch,
-        {
-            "CURIE:odd": [
-                identifier_document("CURIE:odd", f"CURIE:{index}")
-                for index in range(document_count)
-            ]
-        },
+        [
+            identifier_document(f"d{index}", "CURIE:odd", f"CURIE:{index}")
+            for index in range(document_count)
+        ],
     )
 
-    task_id, num_corrections, num_unresolved = (
-        worker_module._curie_duplication_batch_handler(
-            task_id=3,
-            curies=[("CURIE:odd",)],
-            collection_name="collection",
-        )
-    )
-
-    assert (task_id, num_corrections, num_unresolved) == (3, 0, 1)
+    assert run_batch(worker_module, ["CURIE:odd"], task_id=3) == (3, 0, 1)
     assert collection.bulk_write_calls == []
 
 
-def test_resolvable_curie_is_still_written_alongside_an_unresolvable_one(
+def test_shared_curie_with_differing_labels_is_resolved(worker_module, monkeypatch):
+    """
+    The regression that motivated comparing on "i".
+
+    Comparing whole identifier dictionaries made a CURIE carrying two different
+    labels look like two unrelated identifiers: the subset check failed, the
+    intersection branch produced a ReplaceOne whose filter equalled its
+    replacement, and that no-op was reported as a correction while the CURIE
+    stayed duplicated. On CURIEs the subset is obvious and the redundant document
+    goes away.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document(
+                "protein",
+                "CURIE:shared",
+                "CURIE:only-here",
+                node_type="biolink:Protein",
+                labels={"CURIE:shared": "label-A"},
+            ),
+            identifier_document(
+                "small-molecule",
+                "CURIE:shared",
+                labels={"CURIE:shared": "label-B"},
+            ),
+        ],
+    )
+
+    assert run_batch(worker_module, ["CURIE:shared"]) == (0, 1, 0)
+    assert collection.stored("small-molecule") is None
+    assert collection.duplicated_curies() == set()
+
+
+def test_colliding_curies_are_pulled_from_the_non_protein_document(
     worker_module, monkeypatch
 ):
     collection = install_fake_collection(
         worker_module,
         monkeypatch,
-        {
-            # complete subset -> the smaller document can be deleted
-            "CURIE:subset": [
-                identifier_document("CURIE:subset", "CURIE:extra"),
-                identifier_document("CURIE:subset"),
-            ],
-            # neither subset nor intersection is evaluable
-            "CURIE:shared": [
-                identifier_document("CURIE:shared", "CURIE:a"),
-                identifier_document(
-                    "CURIE:shared", "CURIE:b", node_type="biolink:Gene"
-                ),
-            ],
-        },
+        [
+            identifier_document(
+                "protein", "CURIE:shared", "CURIE:p", node_type="biolink:Protein"
+            ),
+            identifier_document("small-molecule", "CURIE:shared", "CURIE:s", "CURIE:t"),
+        ],
     )
 
-    task_id, num_corrections, num_unresolved = (
-        worker_module._curie_duplication_batch_handler(
-            task_id=1,
-            curies=[("CURIE:subset",), ("CURIE:shared",)],
-            collection_name="collection",
-        )
+    assert run_batch(worker_module, ["CURIE:shared"]) == (0, 1, 0)
+    assert collection.curies("protein") == ["CURIE:shared", "CURIE:p"]
+    assert collection.curies("small-molecule") == ["CURIE:s", "CURIE:t"]
+    assert collection.duplicated_curies() == set()
+
+
+def test_two_shared_curies_report_one_correction(worker_module, monkeypatch):
+    """
+    Both CURIEs resolve to the same pair of documents, so the batch queues two
+    delete requests that apply once. Counting the buffer reported two
+    corrections; the write result reports the one document that changed.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document("keep", "CURIE:x", "CURIE:y", "CURIE:extra"),
+            identifier_document("drop", "CURIE:x", "CURIE:y"),
+        ],
     )
 
-    assert (task_id, num_corrections, num_unresolved) == (1, 1, 1)
-    assert len(collection.bulk_write_calls) == 1
-    written_requests = collection.bulk_write_calls[0]
-    assert len(written_requests) == 1
-    assert all(request is not None for request in written_requests)
-    assert isinstance(written_requests[0], worker_module.pymongo.DeleteOne)
+    task_id, corrections, unresolved = run_batch(worker_module, ["CURIE:x", "CURIE:y"])
+
+    assert (task_id, corrections, unresolved) == (0, 1, 0)
+    assert len(collection.bulk_write_calls[0]) == 2, "two requests were issued"
+    assert collection.stored("drop") is None
+    assert collection.duplicated_curies() == set()
+
+
+def test_curie_repeated_within_a_document_is_trimmed(worker_module, monkeypatch):
+    """
+    A repeat alongside a distinct identifier. The comparison-matrix logic scored
+    every identifier as differing from some other and skipped the document, so
+    this was never pruned; its `else` arm was unreachable.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [identifier_document("d1", "CURIE:dupe", "CURIE:dupe", "CURIE:other")],
+    )
+
+    assert run_batch(worker_module, ["CURIE:dupe"]) == (0, 1, 0)
+    assert collection.curies("d1") == ["CURIE:dupe", "CURIE:other"]
+    assert collection.duplicated_curies() == set()
+
+
+def test_document_without_a_repeated_curie_is_not_counted_unresolved(
+    worker_module, monkeypatch
+):
+    """
+    The shard counters record how often a CURIE was seen during upload, so a
+    CURIE counted twice can legitimately land in one document once duplicate
+    `_id` documents were merged. Nothing to trim is a resolution.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [identifier_document("d1", "CURIE:once", "CURIE:other")],
+    )
+
+    assert run_batch(worker_module, ["CURIE:once"]) == (0, 0, 0)
+    assert collection.bulk_write_calls == []
+
+
+def test_trim_does_not_clobber_a_document_changed_underneath_it(
+    worker_module, monkeypatch
+):
+    """
+    The trim pins the identifier array it read. Another worker repairing a
+    different CURIE on the same document wins, and the trim applies nothing
+    rather than reinstating the identifiers that worker removed.
+    """
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [identifier_document("d1", "CURIE:dupe", "CURIE:dupe", "CURIE:other")],
+    )
+    original_find = collection.find
+
+    def find_then_change(query):
+        documents = list(original_find(query))
+        # simulate a concurrent repair landing between the read and the write
+        collection.stored("d1")["identifiers"] = [{"i": "CURIE:dupe", "l": ""}]
+        return iter(documents)
+
+    monkeypatch.setattr(collection, "find", find_then_change)
+
+    assert run_batch(worker_module, ["CURIE:dupe"]) == (0, 0, 0)
+    assert collection.curies("d1") == ["CURIE:dupe"]
+
+
+def test_pull_that_would_empty_a_document_is_left_unresolved(
+    worker_module, monkeypatch
+):
+    collection = install_fake_collection(
+        worker_module,
+        monkeypatch,
+        [
+            identifier_document(
+                "protein", "CURIE:shared", "CURIE:p", node_type="biolink:Protein"
+            ),
+            identifier_document(
+                "small-molecule", "CURIE:shared", "CURIE:shared", "CURIE:shared"
+            ),
+        ],
+    )
+
+    assert run_batch(worker_module, ["CURIE:shared"]) == (0, 0, 1)
+    assert collection.bulk_write_calls == []
 
 
 def test_duplicate_cleanup_aggregates_and_returns_unresolved_totals(
@@ -607,12 +808,10 @@ def test_duplicate_cleanup_still_propagates_real_errors(worker_module, monkeypat
     collection = install_fake_collection(
         worker_module,
         monkeypatch,
-        {
-            "CURIE:subset": [
-                identifier_document("CURIE:subset", "CURIE:extra"),
-                identifier_document("CURIE:subset"),
-            ]
-        },
+        [
+            identifier_document("keep", "CURIE:x", "CURIE:extra"),
+            identifier_document("drop", "CURIE:x"),
+        ],
     )
 
     def failing_bulk_write(_requests):
@@ -622,7 +821,7 @@ def test_duplicate_cleanup_still_propagates_real_errors(worker_module, monkeypat
     monkeypatch.setattr(
         worker_module,
         "_iter_duplicate_curies",
-        lambda _data_folder: iter((("CURIE:subset",),)),
+        lambda _data_folder: iter((("CURIE:x",),)),
     )
 
     with pytest.raises(RuntimeError) as raised:
