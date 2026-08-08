@@ -22,6 +22,7 @@ ordered ahead of the plugin imports.
 """
 
 import ast
+import importlib.util
 import os
 import subprocess
 import sys
@@ -33,6 +34,21 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).parents[1]
 PLUGIN_ROOT = REPOSITORY_ROOT / "plugins"
 BOOTSTRAP_MODULE = "biothings.hub"
+
+
+def _bootstrap_module_installed() -> bool:
+    """
+    Report whether a real biothings[hub] install is importable.
+
+    `find_spec` locates the module without executing it -- importing
+    `biothings.hub` runs `_config_for_app()`, which reads a config module from
+    the working directory and opens the hub database, so it is not something to
+    do just to decide whether to skip.
+    """
+    try:
+        return importlib.util.find_spec(BOOTSTRAP_MODULE) is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def _module_level_imports(source: str) -> list[str]:
@@ -103,6 +119,13 @@ def test_plugin_modules_still_read_config_at_import_time(plugin_name):
     )
 
 
+@pytest.mark.skipif(
+    not _bootstrap_module_installed(),
+    reason=(
+        f"needs a real {BOOTSTRAP_MODULE} install (requirements.txt) -- stubs "
+        "cannot show that importing it installs biothings.config"
+    ),
+)
 def test_spawned_nodenorm_worker_bootstraps_config_and_hub_db(tmp_path):
     config_module_name = "spawn_test_hub_config"
     sqlite_folder = tmp_path / "hubdb"

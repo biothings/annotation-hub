@@ -40,6 +40,46 @@ def worker_module(monkeypatch, tmp_path):
 
     common_module.iter_n = iter_n
 
+    # worker.py imports pymongo at module scope. None of these tests exercise a
+    # pymongo object, so stub it the same way biothings is stubbed above rather
+    # than making the suite depend on a real install.
+    pymongo_module = types.ModuleType("pymongo")
+    errors_module = types.ModuleType("pymongo.errors")
+    collection_module = types.ModuleType("pymongo.collection")
+
+    class BulkWriteError(Exception):
+        def __init__(self, details=None):
+            super().__init__(details)
+            self.details = details if details is not None else {}
+
+    class ServerSelectionTimeoutError(Exception):
+        pass
+
+    class FakeCollection:
+        def __init__(self, database=None, name=None):
+            self.database = database
+            self.name = name
+
+    class FakeWriteOperation:
+        def __init__(self, *arguments):
+            self.arguments = arguments
+
+    errors_module.BulkWriteError = BulkWriteError
+    errors_module.ServerSelectionTimeoutError = ServerSelectionTimeoutError
+    collection_module.Collection = FakeCollection
+    pymongo_module.errors = errors_module
+    pymongo_module.collection = collection_module
+    for operation_name in ("DeleteOne", "ReplaceOne", "UpdateOne"):
+        setattr(
+            pymongo_module,
+            operation_name,
+            type(operation_name, (FakeWriteOperation,), {}),
+        )
+
+    monkeypatch.setitem(sys.modules, "pymongo", pymongo_module)
+    monkeypatch.setitem(sys.modules, "pymongo.errors", errors_module)
+    monkeypatch.setitem(sys.modules, "pymongo.collection", collection_module)
+
     monkeypatch.setitem(sys.modules, "biothings", biothings_module)
     monkeypatch.setitem(sys.modules, "biothings.utils", utils_module)
     monkeypatch.setitem(sys.modules, "biothings.utils.dataload", dataload_module)
