@@ -22,6 +22,10 @@ def _sortable_text() -> dict:
 PUBMED_METADATA_MAPPING = {
     "pubmed": {
         "properties": {
+            "identifiers": {
+                "type": "keyword",
+                "normalizer": "keyword_lowercase_normalizer",
+            },
             "journal": {
                 "properties": {
                     "name": _sortable_text(),
