@@ -304,30 +304,36 @@ map and in a 1000 term query it's difficult to pinpoint which CURIE is the offen
 
 So how do we fix this?
 
-###### sqlite3 identifiers table
-In our newly created worker instance for the nodenorm uploader, we create a sqlite3 table. Fairly
-basic table that tracks all identifiers we find across all documents. If we find a duplicate
-identifier, we increment the count to track all duplicated CURIE's.
+###### Sharded sqlite3 identifier tables
+
+The NodeNorm uploader tracks every identifier encountered across all documents. Duplicate
+identifiers increment a count so they can be corrected after the MongoDB upload. The current
+implementation deterministically routes identifiers across eight SQLite database shards:
 
 ```SQL
-CREATE TABLE IF NOT EXISTS identifiers(identifier text PRIMARY KEY NOT NULL, count INT DEFAULT 1);
+CREATE TABLE IF NOT EXISTS identifiers(
+    identifier text PRIMARY KEY NOT NULL,
+    count INT DEFAULT 1
+) WITHOUT ROWID;
 ```
 
-This produces a behemoth of a table, with around 680 million identifiers and table taking about 50
-GB of space on the file-system. Writing to it as we store the identifiers from each task is now the
-bottleneck of the upload process as we cannot parallelize the writes to sqlite3 and we're writing
-about 5 million records per process for some of the bigger tasks. There could be some configuration
-settings that alleviate this bottleneck, but I haven't investigated that yet. Given this is also a
-temporary solution as the data upstream will eventually resolve this issue I don't wish to devote
-too much time to optimize this solution. 
+Process workers accumulate bounded identifier batches, route them with a stable CRC32 hash, and
+send each shard batch through a bounded multiprocessing queue. One parent writer thread owns each
+SQLite shard and connection, allowing the shards to write in parallel without sharing connections.
+The databases use WAL mode and `synchronous=NORMAL`.
 
-Either way, once we have this table we need to also create an index on it so we can actually
-efficiently get all the documents without it taking forever. This will further balloon the size of
-the table, but it saves a tremendous amount of time. Around this time in the uploading process we
-also create an index for the MongoDB collection. We don't require partial searches so we create a
-regular index over a search index, and we only need it on `identifiers.i`. This also provides a
-tremendous speedup as we're going to have to read each duplicate CURIE correction one-by-one to
-rectify them as we cannot easily do bulk-reads in the same way as writes with MongoDB. 
+After ingestion, each shard receives a partial index over duplicate rows:
+
+```SQL
+CREATE INDEX IF NOT EXISTS idx_identifiers_duplicates
+ON identifiers (count, identifier)
+WHERE count > 1;
+```
+
+The uploader then streams duplicate CURIEs from every shard. It also creates a regular MongoDB index
+on `identifiers.i`, which speeds up the document reads needed during duplicate correction. Storage
+and throughput figures from the former single-database implementation do not describe the sharded
+layout and should be remeasured during a full upload.
 
 This leads to the different ways we have to resolve the duplicate CURIES:
 
@@ -410,4 +416,3 @@ efficient to prune the document before upload
 {"type": "biolink:MacromolecularComplex", "ic": null, "identifiers": [{"i": "ComplexPortal:CPX-3172", "d": [], "t": []}, {"i": "ComplexPortal:CPX-3172", "d": [], "t": []}], "preferred_name": "", "taxa": []}
 {"type": "biolink:MacromolecularComplex", "ic": null, "identifiers": [{"i": "ComplexPortal:CPX-695", "d": [], "t": []}, {"i": "ComplexPortal:CPX-695", "d": [], "t": []}], "preferred_name": "", "taxa": []}
 ```
-

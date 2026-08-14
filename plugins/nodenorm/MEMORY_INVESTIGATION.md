@@ -6,7 +6,7 @@ The May 11, 2026 NodeNorm upload restart appears to be a memory pressure failure
 
 The original SQLite error from an earlier run was real, but the May 11 retry did not show `sqlite3.OperationalError`, `attempt to write a readonly database`, or `database is locked`. The May 11 evidence points instead to the NodeNorm uploader consuming very large amounts of memory while processing file shards and returning identifier lists from worker processes to the parent process.
 
-The first mitigation capped upload concurrency at 30 workers. That confirmed the previous 72-worker behavior was too aggressive, but the retry still climbed into the same memory range as the earlier failed run. The cap alone is not enough. The proposed patch is to stop returning giant identifier lists through `Future` objects and instead stream identifiers through per-task temporary files into SQLite.
+The first mitigation capped upload concurrency at 30 workers. That confirmed the previous 72-worker behavior was too aggressive, but the retry still climbed into the same memory range as the earlier failed run. The cap alone was not enough. The implemented patch stops returning giant identifier lists through `Future` objects and instead streams bounded identifier batches through multiprocessing queues into independently owned SQLite shards.
 
 ## What Happened
 
@@ -145,9 +145,9 @@ Task 89 completed | Update 729236 identifiers | Total identifiers 87331569
 
 There are approximately 251 upload shard tasks, based on `NODENORM_UPLOAD_CHUNKS`. At task 89, the upload was only about 36 percent complete by shard count, yet memory was already near the earlier peak. That strongly supports the memory retention diagnosis.
 
-## Root Cause
+## Root Cause in the Former Design
 
-The uploader creates very large in-memory identifier lists in worker processes, returns those lists to the parent process, then duplicates them again before SQLite insertion.
+The former uploader created very large in-memory identifier lists in worker processes, returned those lists to the parent process, then duplicated them again before SQLite insertion.
 
 The relevant flow is in `plugins/nodenorm/worker.py`.
 
@@ -249,182 +249,52 @@ Worker RSS ~8 to 11 GiB each
 
 This means the issue is not only too many workers. The data transfer model is also wrong for this workload. Returning giant identifier lists through process futures is the main memory multiplier.
 
-## Proposed Patch
+## Implemented Patch
 
-The proposed patch keeps Mongo upload behavior the same, but changes how identifiers move from worker processes to the parent process.
-
-Instead of returning:
-
-```python
-list[str]
-```
-
-each worker should write identifiers to a temporary file and return:
-
-```python
-(identifier_file_path, identifier_count)
-```
-
-The parent should stream the file into SQLite in bounded batches, then delete the temporary file.
-
-### New Flow
-
-Current flow:
+The implemented patch keeps Mongo upload behavior the same but changes how identifiers move from worker processes into SQLite:
 
 ```text
-worker builds giant list
-worker returns giant list
-ProcessPool serializes giant list
-parent receives giant list
-Future retains giant list
-parent builds second list of dicts
-SQLite writes second list
+worker collects at most 100,000 identifiers
+worker routes them deterministically across 8 shards using CRC32
+worker places each nonempty shard batch on its bounded multiprocessing queue
+one parent writer thread owns each SQLite shard and drains its queue
+writer commits up to 8 queued batches at a time
+worker returns only an integer identifier count
+parent discards each completed Future
+duplicate cleanup streams results from every SQLite shard
 ```
 
-Proposed flow:
+Each queue is bounded to 60 pending batches, so backpressure prevents workers from building an unbounded parent-side backlog. A dedicated writer thread and SQLite connection own each shard; workers never share SQLite connections. The shard databases use WAL mode, `synchronous=NORMAL`, `WITHOUT ROWID` identifier tables, and partial duplicate indexes.
 
-```text
-worker writes identifiers line by line to temp file
-worker returns small tuple: file path and count
-parent streams temp file into SQLite in batches
-parent deletes temp file
-Future retains only a small tuple
-```
+All multiprocessing primitives and the process pool use the same explicit `spawn` context. This avoids forking the parent after its SQLite writer threads have started and keeps process behavior consistent across platforms.
 
-### Patch Outline
+`SQLITE_TMPDIR` controls SQLite's own temporary files; it is not used to transfer identifiers between tasks. An operator-provided value is preserved. Otherwise the uploader uses `sqlite_tmp` under `DATA_ARCHIVE_ROOT`, creates the directory before opening SQLite, and verifies that it is writable.
 
-Create a per-run identifier directory under the data folder:
-
-```python
-identifier_chunk_dir = Path(data_folder).joinpath(".identifier_chunks")
-shutil.rmtree(identifier_chunk_dir, ignore_errors=True)
-identifier_chunk_dir.mkdir()
-```
-
-When submitting each task, assign an output file:
-
-```python
-for index, task in enumerate(_build_offset_tasks(data_folder, collection_name)):
-    task["identifier_output_file"] = identifier_chunk_dir / f"{index}.txt"
-    future = executor.submit(subset_upload_worker, **task)
-```
-
-Change the worker signature:
-
-```python
-def subset_upload_worker(..., identifier_output_file: Union[str, Path]) -> tuple[str, int]:
-```
-
-Inside the worker, stream identifiers to disk:
-
-```python
-identifier_count = 0
-
-with open(identifier_output_file, "w", encoding="utf-8") as identifier_handle:
-    ...
-    for identifier in doc["identifiers"]:
-        identifier_handle.write(identifier["i"])
-        identifier_handle.write("\n")
-        identifier_count += 1
-        identifier["c"] = {"gp": None, "dc": None}
-
-return str(identifier_output_file), identifier_count
-```
-
-In the parent, ingest and remove the file:
-
-```python
-identifier_file, identifier_count = future.result()
-update_identifier_collection_from_file(data_folder, identifier_file)
-Path(identifier_file).unlink(missing_ok=True)
-total_document_count += identifier_count
-```
-
-Replace list-of-dicts SQLite insertion with chunked streaming:
-
-```python
-def update_identifier_collection_from_file(data_folder, identifier_file):
-    identifier_database = Path(data_folder).joinpath(IDENTIFIER_LOOKUP_DATABASE)
-    identifier_connection = sqlite3.connect(str(identifier_database))
-    cursor = identifier_connection.cursor()
-
-    upsert_statement = (
-        "INSERT INTO identifiers(identifier) "
-        "VALUES(?) "
-        "ON CONFLICT(identifier) "
-        "DO UPDATE SET count=count+1;"
-    )
-
-    with open(identifier_file, encoding="utf-8") as handle:
-        while True:
-            batch = tuple(
-                (line.rstrip("\n"),)
-                for _, line in zip(range(50000), handle)
-            )
-            if not batch:
-                break
-            cursor.executemany(upsert_statement, batch)
-            identifier_connection.commit()
-
-    identifier_connection.close()
-```
-
-This keeps peak memory bounded by the batch size rather than by the full shard identifier count.
-
-### Optional Additional Improvement
-
-After the temp-file patch, completed futures will retain only small tuples. That makes future retention much less dangerous.
-
-Still, it is cleaner to avoid storing all futures indefinitely. The parent can remove completed futures or use a bounded submission pattern. This is useful, but it is less important once the returned result is small.
-
-## Recommended Worker Count
-
-The 30-worker cap was useful for testing, but it still allowed very high memory usage. After the temp-file patch, a safer next test should use:
-
-```text
-10 to 15 workers
-```
-
-Once the memory profile is stable, increase gradually if needed.
-
-Recommended behavior:
-
-```text
-Default: 10 or 15
-Configurable via environment variable
-Avoid os.cpu_count() for this workload
-```
-
-Example:
-
-```python
-NODENORM_WORKER_COUNT = int(os.getenv("NODENORM_WORKER_COUNT", "15"))
-```
+The current implementation retains the 30-worker cap. The queue and shard design addresses the former result-retention multiplier, but the next full upload still needs memory and throughput monitoring before increasing concurrency.
 
 ## Expected Impact
 
-The patch should reduce memory pressure in three places:
+The patch reduces memory pressure in three places:
 
-1. Workers no longer retain all identifiers as a Python list for return.
-2. The parent no longer receives and stores multi-million-string lists.
-3. SQLite insertion no longer builds a second giant list of dictionaries.
+1. Workers retain only a bounded identifier batch rather than a full shard list.
+2. The parent receives bounded queue traffic rather than multi-million-string `Future` results.
+3. SQLite consumes identifier iterators directly without constructing a second giant list of dictionaries.
 
 Expected runtime tradeoff:
 
 ```text
-Memory: much lower and flatter
-Disk I/O: slightly higher due to temporary identifier files
-Runtime: possibly slightly slower, but much less likely to restart the hub
+Memory: bounded by worker, batch, and queue limits
+IPC: more frequent, bounded queue transfers
+Disk I/O: parallel writes across 8 SQLite shards
+Runtime: dependent on Mongo and SQLite throughput, but without unbounded result retention
 ```
-
-The disk tradeoff is acceptable because the current memory behavior can restart the service and cancel the upload.
 
 ## Verification Plan
 
 Before rerunning:
 
 ```bash
-grep -n "NODENORM_WORKER_COUNT\|identifier_output_file\|update_identifier_collection_from_file" plugins/nodenorm/worker.py
+rg -n 'get_context\("spawn"\)|mp_context=|SQLITE_TMPDIR|_queue_identifier_batch|_write_identifier_batches' plugins/nodenorm/worker.py
 python -m py_compile plugins/nodenorm/worker.py
 ```
 
@@ -471,7 +341,6 @@ Upload reaches duplicate cleanup and final index creation
 
 ## Operational Recommendation
 
-Do not continue full NodeNorm uploads with the current result-return design. Capping worker count helps, but it does not remove the primary memory multiplier.
+Do not run the former result-return design again. Capping worker count alone did not remove its primary memory multiplier.
 
-Apply the temp-file streaming patch first, restart the hub, and retry with a lower worker count such as 10 or 15. If that run is stable, increase the cap gradually.
-
+Deploy the bounded queue and sharded SQLite implementation, restart the hub, and monitor the next full upload at the current 30-worker cap. If memory or disk pressure is still unacceptable, lower the cap before retrying; only increase it after a stable full run.
