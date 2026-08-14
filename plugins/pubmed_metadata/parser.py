@@ -1,6 +1,5 @@
 """Streaming parser and validation for PubMed metadata NDJSON shards."""
 
-import calendar
 import gzip
 import json
 import re
@@ -24,10 +23,21 @@ EXPECTED_RECORD_FIELDS = (
 PMID_PATTERN = re.compile(r"^PMID:[1-9][0-9]*$")
 YEAR_PATTERN = re.compile(r"^[0-9]{4}$")
 NUMERIC_DATE_PART_PATTERN = re.compile(r"^[0-9]{1,2}$")
+# PubMed's exported abbreviations are an English data contract. Keep this fixed
+# rather than deriving it from the process locale through ``calendar``.
 MONTH_NUMBERS = {
-    month_abbreviation.lower(): month_number
-    for month_number, month_abbreviation in enumerate(calendar.month_abbr)
-    if month_abbreviation
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
 }
 
 
