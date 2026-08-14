@@ -25,6 +25,7 @@ PubMed index:
     "title": "Example title",
     "vol": "1",
     "iss": "2",
+    "pubdate_raw": "2026 Jun 30",
     "pub_date": "2026-06-30",
     "abstract": "Example abstract"
   }
@@ -32,19 +33,41 @@ PubMed index:
 ```
 
 The parser streams each compressed shard without materializing it in memory. It
-supports both the legacy ten-field schema and the current schema with
-`identifiers`. It requires string metadata, a list of nonempty identifier
+supports the legacy ten-field schema, the current schema with `identifiers`, and
+the forthcoming schema carrying PubMed's verbatim publication date. Upstream has
+not settled that field's name, so the parser accepts either `pubdate` or
+`pub_date` as the input spelling and always stores it as `pubdate_raw`. That
+rename is deliberate: on our side `pub_date` means the normalized query date
+only, so an input record and an output document never use one name for two
+different values. It requires string metadata, a list of nonempty identifier
 strings containing the record's `PMID:<digits>`, valid UTF-8, and valid
 gzip/NDJSON input. Legacy records without `identifiers` default to their PMID.
 A structurally malformed record fails the upload with the shard and line number
 rather than producing a partial or silently altered document. The default
 storage also treats duplicate IDs as an error.
 
-The parser converts NLM month abbreviations to numbers and preserves the
-available publication-date precision: `YYYY-MM-DD` when all parts exist,
-`YYYY-MM` when the day is missing, and `YYYY` when only the year exists. It
-omits `pub_date` when the year is absent. Elasticsearch maps all three forms as
-a date; partial dates sort at the beginning of their represented period.
+Publication dates deliberately have two representations. `pubdate_raw` retains
+PubMed's display value verbatim, including seasons and ranges such as `1998
+Dec-1999 Jan`. It remains in Elasticsearch `_source` but has neither an
+inverted index nor doc values. The upstream `pub_year`, `pub_month`, and
+`pub_day` components are used transiently during ingestion and are not stored.
+Legacy ten-field and current eleven-field snapshots do not contain the verbatim
+field, so the parser leaves `pubdate_raw` absent rather than synthesizing a
+value that could conceal a previously truncated `MedlineDate`. Full DocMeta date
+projection therefore depends on a new upstream export containing the twelfth
+field.
+
+`pub_date` is a separate query field. The parser emits it only when all three
+components form a valid calendar day, normalized as `YYYY-MM-DD`, and
+Elasticsearch maps it with `strict_date`. Year-only, month-only, seasonal,
+ranged, and otherwise nonexact dates retain their source values but do not get
+a `pub_date`; this avoids turning incomplete dates into artificial points in
+time. A DocumentMetadataAPI adapter can reconstruct exact year/month/day values
+from `pub_date`; when it is absent, it can apply the upstream leading-year and
+remainder convention to `pubdate_raw` for partial, seasonal, and ranged dates.
+`pubdate_raw` remains the fidelity value. Excluding `pub_date` from API
+responses is the adapter's responsibility rather than an Elasticsearch mapping
+concern.
 
 Before queueing a large download, the dumper requires the release's
 `validation_report.json.gz`, verifies that it reports no errors and passes all
@@ -58,12 +81,11 @@ required structural check passes.
 Downloads and uploads are each capped at four concurrent shards. Dumps are not
 scheduled automatically because each full snapshot is very large; an operator
 must trigger the release check. Abstracts are retained in Elasticsearch
-`_source` but are not indexed or sortable. The other metadata fields are
-indexed. `title` supports full-text matching and relevance scoring but is not
-sortable. `journal.name` uses its `.raw` keyword subfield when sorting; the
-keyword and date fields are directly sortable. `identifiers` uses the Hub's
-lowercase keyword normalizer so PMID, DOI, and PMC CURIE lookups are
-case-insensitive.
+`_source` but are not indexed or sortable. `title` supports full-text matching
+and relevance scoring but is not sortable. `journal.name` uses its `.raw`
+keyword subfield when sorting; the searchable keyword and exact-date fields are
+directly sortable. `identifiers` uses the Hub's lowercase keyword normalizer so
+PMID, DOI, and PMC CURIE lookups are case-insensitive.
 Because this is a very large source, the uploader retains only one previous
 MongoDB source collection instead of the BioThings default of ten.
 

@@ -36,12 +36,24 @@ def test_metadata_fields_are_searchable_and_sortable():
     }
 
 
-def test_publication_date_accepts_available_precision():
+def test_verbatim_pubdate_is_source_only():
+    properties = mapping_module.get_pubmed_metadata_mapping()["pubmed"]["properties"]
+
+    assert properties["pubdate_raw"] == {
+        "type": "keyword",
+        "index": False,
+        "doc_values": False,
+    }
+    for field in ("pub_year", "pub_month", "pub_day"):
+        assert field not in properties
+
+
+def test_publication_date_accepts_exact_days_only():
     pub_date = mapping_module.get_pubmed_metadata_mapping()["pubmed"]["properties"][
         "pub_date"
     ]
 
     assert pub_date == {
         "type": "date",
-        "format": "strict_date||strict_year_month||strict_year",
+        "format": "strict_date",
     }

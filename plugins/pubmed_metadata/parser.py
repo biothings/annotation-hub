@@ -21,8 +21,17 @@ BASE_RECORD_FIELDS = (
     "abstract",
 )
 IDENTIFIERS_FIELD = "identifiers"
+# pubmed2db PR #17 currently uses ``pub_date`` for the verbatim value, while
+# ``pubdate`` is under consideration to match NCBI. Accept either upstream name
+# during that transition, but always store the verbatim value as ``pubdate_raw``
+# so that neither upstream spelling collides with ``pub_date``, which on our
+# side means the normalized Elasticsearch query date and nothing else.
+PUBDATE_INPUT_FIELDS = ("pubdate", "pub_date")
 BASE_RECORD_FIELD_SET = frozenset(BASE_RECORD_FIELDS)
-ALLOWED_RECORD_FIELDS = BASE_RECORD_FIELD_SET | {IDENTIFIERS_FIELD}
+ALLOWED_RECORD_FIELDS = BASE_RECORD_FIELD_SET | {
+    IDENTIFIERS_FIELD,
+    *PUBDATE_INPUT_FIELDS,
+}
 PMID_PATTERN = re.compile(r"^PMID:[1-9][0-9]*$")
 YEAR_PATTERN = re.compile(r"^[0-9]{4}$")
 NUMERIC_DATE_PART_PATTERN = re.compile(r"^[0-9]{1,2}$")
@@ -54,66 +63,49 @@ def _location(source: str, line_number: int | None) -> str:
     return f"{source}:{line_number}"
 
 
-def _parse_month(value: str, location: str) -> int:
+def _parse_exact_month(value: str) -> int | None:
     if NUMERIC_DATE_PART_PATTERN.fullmatch(value):
         month = int(value)
     else:
         month = MONTH_NUMBERS.get(value.lower(), 0)
 
-    if not 1 <= month <= 12:
-        raise PubMedMetadataValidationError(
-            f"{location}: invalid publication month {value!r}"
-        )
-    return month
+    return month if 1 <= month <= 12 else None
 
 
-def _build_pub_date(record: dict, location: str) -> str | None:
+def _build_exact_pub_date(record: dict) -> str | None:
+    """Return an exact ISO date, or ``None`` when any part is not exact.
+
+    Date derivation is intentionally non-fatal: unusual or malformed-looking
+    input components simply do not create a query date. Their fidelity value is
+    the source-only ``pubdate_raw`` when the upstream schema provides it.
+    """
+
     year_value = record["pub_year"]
     month_value = record["pub_month"]
     day_value = record["pub_day"]
 
-    if not year_value:
-        if month_value or day_value:
-            raise PubMedMetadataValidationError(
-                f"{location}: publication month/day requires a year"
-            )
+    if not year_value or not month_value or not day_value:
         return None
 
     if YEAR_PATTERN.fullmatch(year_value) is None or int(year_value) == 0:
-        raise PubMedMetadataValidationError(
-            f"{location}: invalid publication year {year_value!r}"
-        )
+        return None
 
-    if not month_value:
-        if day_value:
-            raise PubMedMetadataValidationError(
-                f"{location}: publication day requires a month"
-            )
-        return year_value
-
-    month = _parse_month(month_value, location)
-    year_month = f"{year_value}-{month:02d}"
-    if not day_value:
-        return year_month
-
+    month = _parse_exact_month(month_value)
+    if month is None:
+        return None
     if NUMERIC_DATE_PART_PATTERN.fullmatch(day_value) is None:
-        raise PubMedMetadataValidationError(
-            f"{location}: invalid publication day {day_value!r}"
-        )
+        return None
 
     day = int(day_value)
     try:
         publication_date = date(int(year_value), month, day)
-    except ValueError as error:
-        raise PubMedMetadataValidationError(
-            f"{location}: invalid publication date "
-            f"{year_value!r}/{month_value!r}/{day_value!r}"
-        ) from error
+    except ValueError:
+        return None
     return publication_date.isoformat()
 
 
-def _validate_record_fields(record: dict, location: str) -> None:
-    """Validate that the record matches a supported upstream schema."""
+def _validate_record_fields(record: dict, location: str) -> str | None:
+    """Validate a supported upstream schema and return its raw-date field."""
 
     actual_fields = set(record)
     missing_fields = sorted(BASE_RECORD_FIELD_SET - actual_fields)
@@ -125,6 +117,18 @@ def _validate_record_fields(record: dict, location: str) -> None:
         if extra_fields:
             details.append(f"unexpected fields: {', '.join(extra_fields)}")
         raise PubMedMetadataValidationError(f"{location}: {'; '.join(details)}")
+
+    pubdate_fields = [field for field in PUBDATE_INPUT_FIELDS if field in record]
+    if len(pubdate_fields) > 1:
+        raise PubMedMetadataValidationError(
+            f"{location}: multiple verbatim publication-date fields: "
+            + ", ".join(pubdate_fields)
+        )
+    if pubdate_fields and IDENTIFIERS_FIELD not in record:
+        raise PubMedMetadataValidationError(
+            f"{location}: {pubdate_fields[0]} requires identifiers"
+        )
+    return pubdate_fields[0] if pubdate_fields else None
 
 
 def _validated_identifiers(record: dict, pubmed_id: str, location: str) -> list[str]:
@@ -161,11 +165,13 @@ def transform_pubmed_metadata_record(
             f"{location}: expected a JSON object, got {type(record).__name__}"
         )
 
-    _validate_record_fields(record, location)
+    pubdate_field = _validate_record_fields(record, location)
 
     non_string_fields = sorted(
         field for field in BASE_RECORD_FIELDS if not isinstance(record[field], str)
     )
+    if pubdate_field is not None and not isinstance(record[pubdate_field], str):
+        non_string_fields.append(pubdate_field)
     if non_string_fields:
         raise PubMedMetadataValidationError(
             f"{location}: fields must contain strings: {', '.join(non_string_fields)}"
@@ -189,7 +195,10 @@ def transform_pubmed_metadata_record(
         "iss": record["issue"],
         "abstract": record["abstract"],
     }
-    pub_date = _build_pub_date(record, location)
+    if pubdate_field is not None:
+        pubmed["pubdate_raw"] = record[pubdate_field]
+
+    pub_date = _build_exact_pub_date(record)
     if pub_date is not None:
         pubmed["pub_date"] = pub_date
 

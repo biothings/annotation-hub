@@ -94,6 +94,47 @@ def test_legacy_schema_defaults_identifiers_to_pmid():
     document = parser.transform_pubmed_metadata_record(legacy_record())
 
     assert document["pubmed"]["identifiers"] == ["PMID:12345678"]
+    assert "pubdate_raw" not in document["pubmed"]
+
+
+@pytest.mark.parametrize("field", ["pubdate", "pub_date"])
+def test_accepts_verbatim_pubdate_field_during_upstream_transition(field):
+    record = upstream_record(
+        pub_year="1998",
+        pub_month="Dec-1999 Jan",
+        pub_day="",
+    )
+    record[field] = "1998 Dec-1999 Jan"
+
+    document = parser.transform_pubmed_metadata_record(record)
+
+    assert document["pubmed"]["pubdate_raw"] == "1998 Dec-1999 Jan"
+    for component in ("pub_year", "pub_month", "pub_day"):
+        assert component not in document["pubmed"]
+    assert "pub_date" not in document["pubmed"]
+
+
+def test_preserves_verbatim_pubdate_alongside_exact_query_date():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(pubdate="2026 Jun 30")
+    )
+
+    assert document["pubmed"]["pubdate_raw"] == "2026 Jun 30"
+    assert document["pubmed"]["pub_date"] == "2026-06-30"
+
+
+def test_exact_looking_medline_date_remains_raw_only():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            pub_year="2019",
+            pub_month="Mar 15",
+            pub_day="",
+            pubdate="2019 Mar 15",
+        )
+    )
+
+    assert document["pubmed"]["pubdate_raw"] == "2019 Mar 15"
+    assert "pub_date" not in document["pubmed"]
 
 
 @pytest.mark.parametrize(
@@ -131,13 +172,11 @@ def test_rejects_invalid_records(record, message):
 @pytest.mark.parametrize(
     ("date_parts", "expected_date"),
     [
-        ({"pub_year": "2026", "pub_month": "Jun", "pub_day": ""}, "2026-06"),
-        ({"pub_year": "2026", "pub_month": "", "pub_day": ""}, "2026"),
         ({"pub_year": "2026", "pub_month": "6", "pub_day": "3"}, "2026-06-03"),
         ({"pub_year": "2024", "pub_month": "feb", "pub_day": "29"}, "2024-02-29"),
     ],
 )
-def test_builds_dates_at_available_precision(date_parts, expected_date):
+def test_builds_exact_dates(date_parts, expected_date):
     document = parser.transform_pubmed_metadata_record(
         upstream_record(**date_parts)
     )
@@ -145,42 +184,58 @@ def test_builds_dates_at_available_precision(date_parts, expected_date):
     assert document["pubmed"]["pub_date"] == expected_date
 
 
-def test_omits_date_when_all_components_are_missing():
-    document = parser.transform_pubmed_metadata_record(
-        upstream_record(pub_year="", pub_month="", pub_day="")
-    )
+@pytest.mark.parametrize(
+    "date_parts",
+    [
+        {"pub_year": "2026", "pub_month": "Jun", "pub_day": ""},
+        {"pub_year": "2026", "pub_month": "", "pub_day": ""},
+        {"pub_year": "", "pub_month": "", "pub_day": ""},
+        {"pub_year": "", "pub_month": "Jun", "pub_day": ""},
+        {"pub_year": "2026", "pub_month": "", "pub_day": "15"},
+        {"pub_year": "26", "pub_month": "Jun", "pub_day": "15"},
+        {"pub_year": "2026", "pub_month": "Sep-Dec", "pub_day": ""},
+        {"pub_year": "2026", "pub_month": "Spring", "pub_day": ""},
+        {"pub_year": "1998", "pub_month": "Dec-1999 Jan", "pub_day": ""},
+        {"pub_year": "2026", "pub_month": "Smarch", "pub_day": "15"},
+        {"pub_year": "2026", "pub_month": "13", "pub_day": "15"},
+        {"pub_year": "2026", "pub_month": "Feb", "pub_day": "30"},
+    ],
+)
+def test_discards_input_components_when_no_exact_date_can_be_derived(date_parts):
+    document = parser.transform_pubmed_metadata_record(upstream_record(**date_parts))
 
+    for component in ("pub_year", "pub_month", "pub_day"):
+        assert component not in document["pubmed"]
     assert "pub_date" not in document["pubmed"]
 
 
-@pytest.mark.parametrize(
-    ("date_parts", "message"),
-    [
-        (
-            {"pub_year": "", "pub_month": "Jun", "pub_day": ""},
-            "publication month/day requires a year",
-        ),
-        (
-            {"pub_year": "2026", "pub_month": "", "pub_day": "15"},
-            "publication day requires a month",
-        ),
-        (
-            {"pub_year": "26", "pub_month": "", "pub_day": ""},
-            "invalid publication year",
-        ),
-        (
-            {"pub_year": "2026", "pub_month": "Smarch", "pub_day": ""},
-            "invalid publication month",
-        ),
-        (
-            {"pub_year": "2026", "pub_month": "Feb", "pub_day": "30"},
-            "invalid publication date",
-        ),
-    ],
-)
-def test_rejects_invalid_date_components(date_parts, message):
-    with pytest.raises(parser.PubMedMetadataValidationError, match=message):
-        parser.transform_pubmed_metadata_record(upstream_record(**date_parts))
+def test_rejects_verbatim_pubdate_without_identifiers():
+    record = legacy_record()
+    record["pubdate"] = "2026 Jun 30"
+
+    with pytest.raises(
+        parser.PubMedMetadataValidationError,
+        match="pubdate requires identifiers",
+    ):
+        parser.transform_pubmed_metadata_record(record)
+
+
+def test_rejects_multiple_verbatim_pubdate_fields():
+    record = upstream_record(pubdate="2026 Jun 30", pub_date="2026 Jun 30")
+
+    with pytest.raises(
+        parser.PubMedMetadataValidationError,
+        match="multiple verbatim publication-date fields",
+    ):
+        parser.transform_pubmed_metadata_record(record)
+
+
+def test_rejects_non_string_verbatim_pubdate():
+    with pytest.raises(
+        parser.PubMedMetadataValidationError,
+        match="fields must contain strings: pubdate",
+    ):
+        parser.transform_pubmed_metadata_record(upstream_record(pubdate=20260630))
 
 
 def test_reports_shard_and_line_for_invalid_json(tmp_path):
