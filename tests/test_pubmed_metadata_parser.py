@@ -20,6 +20,11 @@ PARSER_SPEC.loader.exec_module(parser)
 def upstream_record(**overrides):
     record = {
         "id": "PMID:12345678",
+        "identifiers": [
+            "PMID:12345678",
+            "doi:10.1000/Example",
+            "PMC:PMC1234567",
+        ],
         "journal_name": "Journal of Examples",
         "journal_abbrev": "J Ex",
         "article_title": "A useful example",
@@ -31,6 +36,14 @@ def upstream_record(**overrides):
         "abstract": "An abstract with Unicode: β.",
     }
     record.update(overrides)
+    if "id" in overrides and "identifiers" not in overrides:
+        record["identifiers"] = [record["id"]]
+    return record
+
+
+def legacy_record(**overrides):
+    record = upstream_record(**overrides)
+    del record["identifiers"]
     return record
 
 
@@ -45,6 +58,11 @@ def test_transform_namespaces_pubmed_metadata():
     assert document == {
         "_id": "PMID:12345678",
         "pubmed": {
+            "identifiers": [
+                "PMID:12345678",
+                "doi:10.1000/Example",
+                "PMC:PMC1234567",
+            ],
             "journal": {
                 "name": "Journal of Examples",
                 "abbr": "J Ex",
@@ -72,6 +90,12 @@ def test_streams_gzip_ndjson(tmp_path):
     assert documents[0]["pubmed"]["abstract"].endswith("β.")
 
 
+def test_legacy_schema_defaults_identifiers_to_pmid():
+    document = parser.transform_pubmed_metadata_record(legacy_record())
+
+    assert document["pubmed"]["identifiers"] == ["PMID:12345678"]
+
+
 @pytest.mark.parametrize(
     ("record", "message"),
     [
@@ -85,6 +109,18 @@ def test_streams_gzip_ndjson(tmp_path):
         ),
         (upstream_record(id="12345678"), "invalid PubMed identifier"),
         (upstream_record(pub_year=2026), "fields must contain strings: pub_year"),
+        (
+            upstream_record(identifiers="PMID:12345678"),
+            "identifiers must be a list of nonempty strings",
+        ),
+        (
+            upstream_record(identifiers=["PMID:12345678", ""]),
+            "identifiers must be a list of nonempty strings",
+        ),
+        (
+            upstream_record(identifiers=["doi:10.1000/example"]),
+            "identifiers must contain 'PMID:12345678'",
+        ),
     ],
 )
 def test_rejects_invalid_records(record, message):

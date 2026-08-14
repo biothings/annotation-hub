@@ -13,6 +13,11 @@ PubMed index:
 {
   "_id": "PMID:12345678",
   "pubmed": {
+    "identifiers": [
+      "PMID:12345678",
+      "doi:10.1000/example",
+      "PMC:PMC1234567"
+    ],
     "journal": {
       "name": "Example Journal",
       "abbr": "Example J"
@@ -27,11 +32,13 @@ PubMed index:
 ```
 
 The parser streams each compressed shard without materializing it in memory. It
-requires the exact ten-field upstream schema, string values, valid `PMID:<digits>`
-identifiers, valid UTF-8, and valid gzip/NDJSON input. A malformed record fails
-the upload with the shard and line number rather than producing a partial or
-silently altered document. The default storage also treats duplicate IDs as an
-error.
+supports both the legacy ten-field schema and the current schema with
+`identifiers`. It requires string metadata, a list of nonempty identifier
+strings containing the record's `PMID:<digits>`, valid UTF-8, and valid
+gzip/NDJSON input. Legacy records without `identifiers` default to their PMID.
+A structurally malformed record fails the upload with the shard and line number
+rather than producing a partial or silently altered document. The default
+storage also treats duplicate IDs as an error.
 
 The parser converts NLM month abbreviations to numbers and preserves the
 available publication-date precision: `YYYY-MM-DD` when all parts exist,
@@ -54,7 +61,9 @@ must trigger the release check. Abstracts are retained in Elasticsearch
 `_source` but are not indexed or sortable. The other metadata fields are
 indexed. `title` supports full-text matching and relevance scoring but is not
 sortable. `journal.name` uses its `.raw` keyword subfield when sorting; the
-keyword and date fields are directly sortable.
+keyword and date fields are directly sortable. `identifiers` uses the Hub's
+lowercase keyword normalizer so PMID, DOI, and PMC CURIE lookups are
+case-insensitive.
 Because this is a very large source, the uploader retains only one previous
 MongoDB source collection instead of the BioThings default of ten.
 
@@ -68,11 +77,11 @@ index temporarily for rollback and remove it separately after validation.
 Build configuration and alias state are deployment state and are not stored in
 this repository.
 
-This is a full snapshot rather than an incremental feed. DOI and PMC identifiers
-are not present in this export. Release discovery is based on the upstream
-`YYYYmonD`/`YYYYmonDD` directory names, while release completeness and schema
-compatibility are gated by the published validation report and the parser's
-strict record validation.
+This is a full snapshot rather than an incremental feed. Current exports include
+the PMID plus available DOI and PMC identifiers. Release discovery is based on
+the upstream `YYYYmonD`/`YYYYmonDD` directory names, while release completeness
+and schema compatibility are gated by the published validation report and the
+parser's strict record validation.
 
 The export is produced by [TranslatorSRI/pubmed2db](https://github.com/TranslatorSRI/pubmed2db)
 from NLM PubMed data. Downstream use must follow the

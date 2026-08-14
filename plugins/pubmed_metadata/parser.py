@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-EXPECTED_RECORD_FIELDS = (
+BASE_RECORD_FIELDS = (
     "id",
     "journal_name",
     "journal_abbrev",
@@ -20,6 +20,9 @@ EXPECTED_RECORD_FIELDS = (
     "pub_day",
     "abstract",
 )
+IDENTIFIERS_FIELD = "identifiers"
+BASE_RECORD_FIELD_SET = frozenset(BASE_RECORD_FIELDS)
+ALLOWED_RECORD_FIELDS = BASE_RECORD_FIELD_SET | {IDENTIFIERS_FIELD}
 PMID_PATTERN = re.compile(r"^PMID:[1-9][0-9]*$")
 YEAR_PATTERN = re.compile(r"^[0-9]{4}$")
 NUMERIC_DATE_PART_PATTERN = re.compile(r"^[0-9]{1,2}$")
@@ -109,6 +112,41 @@ def _build_pub_date(record: dict, location: str) -> str | None:
     return publication_date.isoformat()
 
 
+def _validate_record_fields(record: dict, location: str) -> None:
+    """Validate that the record matches a supported upstream schema."""
+
+    actual_fields = set(record)
+    missing_fields = sorted(BASE_RECORD_FIELD_SET - actual_fields)
+    extra_fields = sorted(str(field) for field in actual_fields - ALLOWED_RECORD_FIELDS)
+    if missing_fields or extra_fields:
+        details = []
+        if missing_fields:
+            details.append(f"missing fields: {', '.join(missing_fields)}")
+        if extra_fields:
+            details.append(f"unexpected fields: {', '.join(extra_fields)}")
+        raise PubMedMetadataValidationError(f"{location}: {'; '.join(details)}")
+
+
+def _validated_identifiers(record: dict, pubmed_id: str, location: str) -> list[str]:
+    """Return upstream identifiers, or the PMID for legacy ten-field data."""
+
+    if IDENTIFIERS_FIELD not in record:
+        return [pubmed_id]
+
+    identifiers = record[IDENTIFIERS_FIELD]
+    if not isinstance(identifiers, list) or not all(
+        isinstance(identifier, str) and identifier for identifier in identifiers
+    ):
+        raise PubMedMetadataValidationError(
+            f"{location}: identifiers must be a list of nonempty strings"
+        )
+    if pubmed_id not in identifiers:
+        raise PubMedMetadataValidationError(
+            f"{location}: identifiers must contain {pubmed_id!r}"
+        )
+    return list(identifiers)
+
+
 def transform_pubmed_metadata_record(
     record: object,
     *,
@@ -123,20 +161,10 @@ def transform_pubmed_metadata_record(
             f"{location}: expected a JSON object, got {type(record).__name__}"
         )
 
-    expected_fields = set(EXPECTED_RECORD_FIELDS)
-    actual_fields = set(record)
-    missing_fields = sorted(expected_fields - actual_fields)
-    extra_fields = sorted(str(field) for field in actual_fields - expected_fields)
-    if missing_fields or extra_fields:
-        details = []
-        if missing_fields:
-            details.append(f"missing fields: {', '.join(missing_fields)}")
-        if extra_fields:
-            details.append(f"unexpected fields: {', '.join(extra_fields)}")
-        raise PubMedMetadataValidationError(f"{location}: {'; '.join(details)}")
+    _validate_record_fields(record, location)
 
     non_string_fields = sorted(
-        field for field in EXPECTED_RECORD_FIELDS if not isinstance(record[field], str)
+        field for field in BASE_RECORD_FIELDS if not isinstance(record[field], str)
     )
     if non_string_fields:
         raise PubMedMetadataValidationError(
@@ -148,8 +176,10 @@ def transform_pubmed_metadata_record(
         raise PubMedMetadataValidationError(
             f"{location}: invalid PubMed identifier {pubmed_id!r}"
         )
+    identifiers = _validated_identifiers(record, pubmed_id, location)
 
     pubmed = {
+        "identifiers": identifiers,
         "journal": {
             "name": record["journal_name"],
             "abbr": record["journal_abbrev"],

@@ -30,6 +30,10 @@ def test_metadata_fields_are_searchable_and_sortable():
     assert properties["journal"]["properties"]["abbr"] == {"type": "keyword"}
     assert properties["vol"] == {"type": "keyword"}
     assert properties["iss"] == {"type": "keyword"}
+    assert properties["identifiers"] == {
+        "type": "keyword",
+        "normalizer": "keyword_lowercase_normalizer",
+    }
 
 
 def test_publication_date_accepts_available_precision():
