@@ -3,7 +3,7 @@
 from copy import deepcopy
 
 
-PUBMED_DATE_FORMAT = "strict_date||strict_year_month||strict_year"
+PUBMED_DATE_FORMAT = "strict_date"
 MAX_SORTABLE_TEXT_LENGTH = 8191
 
 
@@ -16,6 +16,14 @@ def _sortable_text() -> dict:
                 "ignore_above": MAX_SORTABLE_TEXT_LENGTH,
             }
         },
+    }
+
+
+def _source_only_keyword() -> dict:
+    return {
+        "type": "keyword",
+        "index": False,
+        "doc_values": False,
     }
 
 
@@ -35,6 +43,7 @@ PUBMED_METADATA_MAPPING = {
             "title": {"type": "text"},
             "vol": {"type": "keyword"},
             "iss": {"type": "keyword"},
+            "pubdate_raw": _source_only_keyword(),
             "pub_date": {
                 "type": "date",
                 "format": PUBMED_DATE_FORMAT,
