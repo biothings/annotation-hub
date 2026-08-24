@@ -14,7 +14,6 @@ PubMed index:
   "_id": "PMID:12345678",
   "pubmed": {
     "identifiers": [
-      "PMID:12345678",
       "doi:10.1000/example",
       "PMC:PMC1234567"
     ],
@@ -41,7 +40,10 @@ rename is deliberate: on our side `pub_date` means the normalized query date
 only, so an input record and an output document never use one name for two
 different values. It requires string metadata, a list of nonempty identifier
 strings containing the record's `PMID:<digits>`, valid UTF-8, and valid
-gzip/NDJSON input. Legacy records without `identifiers` default to their PMID.
+gzip/NDJSON input. The canonical PMID is always the Elasticsearch `_id`; it is
+validated as an exact member of current upstream `identifiers` arrays, then
+removed from that array before storage so `pubmed.identifiers` contains only
+alternates. Legacy records without `identifiers` store an empty identifier list.
 A well-formed upstream `PMCID:PMC<digits>` identifier is normalized during
 upload to the established `PMC:PMC<digits>` contract. If both spellings are
 present, the first position is retained and the canonical identifier is stored
@@ -95,13 +97,15 @@ must trigger the release check. Abstracts are retained in Elasticsearch
 and relevance scoring but is not sortable. `journal.name` uses its `.raw`
 keyword subfield when sorting; the searchable keyword and exact-date fields are
 directly sortable. `identifiers` uses the Hub's lowercase keyword normalizer so
-PMID, DOI, and PMC CURIE lookups are case-insensitive.
+DOI and PMC CURIE lookups are case-insensitive. PMIDs resolve through the
+document `_id` instead of this alternate-identifier field.
 Because this is a very large source, the uploader retains only one previous
 MongoDB source collection instead of the BioThings default of ten.
 
 Build `pubmed_metadata` by itself into a versioned `pubmed_*` Elasticsearch
 index. After validating the index, point the stable `annotator-pubmed` alias to
-it. NodeAnnotator routes `PMID:` identifiers to that alias.
+it. NodeAnnotator routes `PMID:` identifiers to exact `_id` lookups on that
+alias.
 
 For subsequent releases, move the alias from the previous index to the newly
 validated index in one atomic Elasticsearch alias update. Keep the previous
@@ -109,11 +113,13 @@ index temporarily for rollback and remove it separately after validation.
 Build configuration and alias state are deployment state and are not stored in
 this repository.
 
-This is a full snapshot rather than an incremental feed. Current exports include
-the PMID plus available DOI and PMC identifiers. Release discovery is based on
-the upstream `YYYYmonD`/`YYYYmonDD` directory names, while release completeness
-and schema compatibility are gated by the published validation report and the
-parser's strict record validation.
+This is a full snapshot rather than an incremental feed. Current upstream
+exports include the PMID plus available DOI and PMC identifiers; the uploader
+retains the latter identifiers as alternates after validating and removing the
+primary PMID. Release discovery is based on the upstream
+`YYYYmonD`/`YYYYmonDD` directory names, while release completeness and schema
+compatibility are gated by the published validation report and the parser's
+strict record validation.
 
 The export is produced by [TranslatorSRI/pubmed2db](https://github.com/TranslatorSRI/pubmed2db)
 from NLM PubMed data. Downstream use must follow the

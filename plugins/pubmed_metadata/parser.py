@@ -134,7 +134,7 @@ def _validate_record_fields(record: dict, location: str) -> str | None:
 
 
 def _validated_identifiers(record: dict, pubmed_id: str, location: str) -> list[str]:
-    """Return upstream identifiers, or the PMID for legacy ten-field data."""
+    """Return upstream identifiers, or the canonical PMID for legacy data."""
 
     if IDENTIFIERS_FIELD not in record:
         return [pubmed_id]
@@ -210,9 +210,17 @@ def transform_pubmed_metadata_record(
         raise PubMedMetadataValidationError(
             f"{location}: invalid PubMed identifier {pubmed_id!r}"
         )
-    identifiers = _normalize_identifiers(
+    normalized_identifiers = _normalize_identifiers(
         _validated_identifiers(record, pubmed_id, location)
     )
+    # Elasticsearch ``_id`` is the canonical PMID. Keep ``identifiers`` for
+    # alternate identifiers only, while validating the upstream primary PMID
+    # before normalization and filtering.
+    identifiers = [
+        identifier
+        for identifier in normalized_identifiers
+        if identifier != pubmed_id
+    ]
 
     pubmed = {
         "identifiers": identifiers,
