@@ -33,6 +33,8 @@ ALLOWED_RECORD_FIELDS = BASE_RECORD_FIELD_SET | {
     *PUBDATE_INPUT_FIELDS,
 }
 PMID_PATTERN = re.compile(r"^PMID:[1-9][0-9]*$")
+PMCID_ALIAS_PATTERN = re.compile(r"^PMCID:(PMC[0-9]+)$")
+CANONICAL_PMC_PATTERN = re.compile(r"^PMC:PMC[0-9]+$")
 YEAR_PATTERN = re.compile(r"^[0-9]{4}$")
 NUMERIC_DATE_PART_PATTERN = re.compile(r"^[0-9]{1,2}$")
 # PubMed's exported abbreviations are an English data contract. Keep this fixed
@@ -148,7 +150,33 @@ def _validated_identifiers(record: dict, pubmed_id: str, location: str) -> list[
         raise PubMedMetadataValidationError(
             f"{location}: identifiers must contain {pubmed_id!r}"
         )
-    return list(identifiers)
+    return identifiers
+
+
+def _normalize_identifiers(identifiers: list[str]) -> list[str]:
+    """Canonicalize well-formed PMCID aliases without disturbing other values."""
+
+    normalized_identifiers: list[str] = []
+    seen_pmc_identifiers: set[str] = set()
+    for identifier in identifiers:
+        alias_match = (
+            PMCID_ALIAS_PATTERN.fullmatch(identifier)
+            if identifier.startswith("PMCID:")
+            else None
+        )
+        normalized_identifier = (
+            f"PMC:{alias_match.group(1)}" if alias_match else identifier
+        )
+        is_canonical_pmc = (
+            normalized_identifier.startswith("PMC:")
+            and CANONICAL_PMC_PATTERN.fullmatch(normalized_identifier) is not None
+        )
+        if is_canonical_pmc:
+            if normalized_identifier in seen_pmc_identifiers:
+                continue
+            seen_pmc_identifiers.add(normalized_identifier)
+        normalized_identifiers.append(normalized_identifier)
+    return normalized_identifiers
 
 
 def transform_pubmed_metadata_record(
@@ -182,7 +210,9 @@ def transform_pubmed_metadata_record(
         raise PubMedMetadataValidationError(
             f"{location}: invalid PubMed identifier {pubmed_id!r}"
         )
-    identifiers = _validated_identifiers(record, pubmed_id, location)
+    identifiers = _normalize_identifiers(
+        _validated_identifiers(record, pubmed_id, location)
+    )
 
     pubmed = {
         "identifiers": identifiers,

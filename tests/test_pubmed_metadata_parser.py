@@ -97,6 +97,77 @@ def test_legacy_schema_defaults_identifiers_to_pmid():
     assert "pubdate_raw" not in document["pubmed"]
 
 
+def test_normalizes_well_formed_pmcid_aliases_preserving_order():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=[
+                "PMID:12345678",
+                "PMCID:PMC7654321",
+                "doi:10.1000/Example",
+            ]
+        )
+    )
+
+    assert document["pubmed"]["identifiers"] == [
+        "PMID:12345678",
+        "PMC:PMC7654321",
+        "doi:10.1000/Example",
+    ]
+
+
+def test_preserves_malformed_pmcid_aliases():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=["PMID:12345678", "PMCID:wh_2021_113"]
+        )
+    )
+
+    assert document["pubmed"]["identifiers"] == [
+        "PMID:12345678",
+        "PMCID:wh_2021_113",
+    ]
+
+
+def test_deduplicates_canonical_pmc_and_pmcid_alias_only():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=[
+                "PMID:12345678",
+                "PMC:PMC7654321",
+                "PMCID:PMC7654321",
+                "doi:10.1000/Example",
+                "doi:10.1000/Example",
+            ]
+        )
+    )
+
+    assert document["pubmed"]["identifiers"] == [
+        "PMID:12345678",
+        "PMC:PMC7654321",
+        "doi:10.1000/Example",
+        "doi:10.1000/Example",
+    ]
+
+
+def test_alias_collision_keeps_the_first_identifier_position():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=[
+                "PMID:12345678",
+                "PMCID:PMC7654321",
+                "doi:10.1000/Example",
+                "PMC:PMC7654321",
+            ]
+        )
+    )
+
+    assert document["pubmed"]["identifiers"] == [
+        "PMID:12345678",
+        "PMC:PMC7654321",
+        "doi:10.1000/Example",
+    ]
+
+
 @pytest.mark.parametrize("field", ["pubdate", "pub_date"])
 def test_accepts_verbatim_pubdate_field_during_upstream_transition(field):
     record = upstream_record(

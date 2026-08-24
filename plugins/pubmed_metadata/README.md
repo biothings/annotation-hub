@@ -42,6 +42,10 @@ only, so an input record and an output document never use one name for two
 different values. It requires string metadata, a list of nonempty identifier
 strings containing the record's `PMID:<digits>`, valid UTF-8, and valid
 gzip/NDJSON input. Legacy records without `identifiers` default to their PMID.
+A well-formed upstream `PMCID:PMC<digits>` identifier is normalized during
+upload to the established `PMC:PMC<digits>` contract. If both spellings are
+present, the first position is retained and the canonical identifier is stored
+once; malformed `PMCID:` values and unrelated identifiers remain unchanged.
 A structurally malformed record fails the upload with the shard and line number
 rather than producing a partial or silently altered document. The default
 storage also treats duplicate IDs as an error.
