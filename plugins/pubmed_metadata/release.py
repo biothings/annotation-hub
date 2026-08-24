@@ -28,7 +28,7 @@ _RELEASE_PATTERN = re.compile(
     r"^(?P<year>\d{4})(?P<month>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
     r"(?P<day>0?[1-9]|[12]\d|3[01])$"
 )
-_SHARD_PATTERN = re.compile(r"^pubmed_metadata_(?P<index>\d{5})\.ndjson\.gz$")
+_SHARD_PATTERN = re.compile(r"^pubmed_metadata_(?P<index>\d+)\.ndjson\.gz$")
 _REQUIRED_STRUCTURE_CHECKS = frozenset(
     {
         "shards-found",
@@ -106,7 +106,7 @@ def releases_from_index(index_html: str) -> tuple[str, ...]:
 
 
 def validate_shard_filenames(filenames: Iterable[str]) -> tuple[str, ...]:
-    """Return a sorted, contiguous set of PubMed shard filenames."""
+    """Return the actual shard names, sorted by a contiguous numeric index."""
 
     indexed_names: dict[int, str] = {}
     for filename in filenames:
@@ -115,7 +115,7 @@ def validate_shard_filenames(filenames: Iterable[str]) -> tuple[str, ...]:
             continue
         index = int(match.group("index"))
         if index in indexed_names:
-            raise PubMedReleaseError(f"duplicate PubMed shard index: {index:05d}")
+            raise PubMedReleaseError(f"duplicate PubMed shard index: {index}")
         indexed_names[index] = filename
 
     if not indexed_names:
@@ -124,10 +124,10 @@ def validate_shard_filenames(filenames: Iterable[str]) -> tuple[str, ...]:
     expected_indices = list(range(len(indexed_names)))
     actual_indices = sorted(indexed_names)
     if actual_indices != expected_indices:
-        expected = ", ".join(f"{index:05d}" for index in expected_indices)
-        actual = ", ".join(f"{index:05d}" for index in actual_indices)
+        expected = ", ".join(str(index) for index in expected_indices)
+        actual = ", ".join(str(index) for index in actual_indices)
         raise PubMedReleaseError(
-            "PubMed shard indices must be contiguous from 00000; "
+            "PubMed shard indices must be contiguous from 0; "
             f"expected [{expected}], found [{actual}]"
         )
 
@@ -135,14 +135,20 @@ def validate_shard_filenames(filenames: Iterable[str]) -> tuple[str, ...]:
 
 
 def parse_validation_report(payload: bytes) -> Mapping:
-    """Decode one gzip-compressed JSON validation report."""
+    """Decode either a gzip-compressed or plain JSON validation report."""
 
     try:
-        report = json.loads(gzip.decompress(payload).decode("utf-8"))
-    except (EOFError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if payload.startswith(b"\x1f\x8b"):
+            decoded_payload = gzip.decompress(payload)
+        else:
+            decoded_payload = payload
+        report = json.loads(decoded_payload.decode("utf-8"))
+    except (EOFError, OSError) as exc:
         raise PubMedReleaseError(
             "PubMed validation report is not valid gzip-compressed JSON"
         ) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+        raise PubMedReleaseError("PubMed validation report is not valid JSON") from exc
     if not isinstance(report, Mapping):
         raise PubMedReleaseError("PubMed validation report is not a JSON object")
     return report
@@ -166,17 +172,30 @@ def validate_report(report: object, shard_filenames: Iterable[str]) -> None:
         for check in checks_run
         if isinstance(check, Mapping) and check.get("section") == "structure"
     ]
-    if not structure_checks or any(
-        check.get("status") != "pass" for check in structure_checks
-    ):
+    if not structure_checks:
         raise PubMedReleaseError(
             "PubMed validation report did not pass all structure checks"
         )
-    structure_check_names = {
-        check.get("name")
-        for check in structure_checks
-        if isinstance(check.get("name"), str)
-    }
+
+    structure_check_names: set[str] = set()
+    for check in structure_checks:
+        name = check.get("name")
+        if not isinstance(name, str) or not name:
+            raise PubMedReleaseError(
+                "PubMed validation report has an unnamed structure check"
+            )
+        if name in structure_check_names:
+            raise PubMedReleaseError(
+                f"PubMed validation report repeats structure check: {name}"
+            )
+        structure_check_names.add(name)
+
+        allowed_statuses = {"pass", "warn"} if name == "month-format" else {"pass"}
+        if check.get("status") not in allowed_statuses:
+            raise PubMedReleaseError(
+                "PubMed validation report did not pass all structure checks"
+            )
+
     missing_checks = sorted(_REQUIRED_STRUCTURE_CHECKS - structure_check_names)
     if missing_checks:
         raise PubMedReleaseError(

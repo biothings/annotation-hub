@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -19,7 +20,12 @@ from .release import (
     validate_report,
     validate_shard_filenames,
 )
-from .static import PUBMED_METADATA_ROOT_URL, VALIDATION_REPORT_FILENAME
+from .static import (
+    MANIFESTS_DIRECTORY,
+    MANIFEST_VALIDATION_REPORT_FILENAME_FORMAT,
+    PUBMED_METADATA_ROOT_URL,
+    VALIDATION_REPORT_FILENAME,
+)
 
 
 class PubMedMetadataDumper(HTTPDumper):
@@ -46,25 +52,39 @@ class PubMedMetadataDumper(HTTPDumper):
                 f"Unable to read PubMed release metadata from {url}: {exc}"
             ) from exc
 
-    def _release_inventory(self, release: str) -> tuple[str, tuple[str, ...]] | None:
+    def _release_inventory(
+        self,
+        release: str,
+        get_manifest_filenames: Callable[[], tuple[str, ...]],
+    ) -> tuple[str, tuple[str, ...], str, str] | None:
         release_url = urljoin(self.SOURCE_ROOT_URL, f"{release}/")
         index_response = self._get(release_url)
         filenames = extract_index_hrefs(index_response.text)
 
-        if VALIDATION_REPORT_FILENAME not in filenames:
-            self.logger.info(
-                "Ignoring incomplete PubMed release %s: %s is not published",
-                release,
-                VALIDATION_REPORT_FILENAME,
+        if VALIDATION_REPORT_FILENAME in filenames:
+            report_filename = VALIDATION_REPORT_FILENAME
+            report_url = urljoin(release_url, report_filename)
+        else:
+            report_filename = MANIFEST_VALIDATION_REPORT_FILENAME_FORMAT.format(
+                release_date(release)
             )
-            return None
+            if report_filename not in get_manifest_filenames():
+                self.logger.info(
+                    "Ignoring incomplete PubMed release %s: "
+                    "no matching completion report",
+                    release,
+                )
+                return None
+            report_url = urljoin(
+                self.SOURCE_ROOT_URL,
+                f"{MANIFESTS_DIRECTORY}/{report_filename}",
+            )
 
         try:
             shard_filenames = validate_shard_filenames(filenames)
         except PubMedReleaseError as exc:
             raise DumperException(f"Invalid PubMed release {release}: {exc}") from exc
 
-        report_url = urljoin(release_url, VALIDATION_REPORT_FILENAME)
         report_response = self._get(report_url)
         try:
             report = parse_validation_report(report_response.content)
@@ -72,7 +92,7 @@ class PubMedMetadataDumper(HTTPDumper):
         except PubMedReleaseError as exc:
             raise DumperException(f"Invalid PubMed release {release}: {exc}") from exc
 
-        return release_url, shard_filenames
+        return release_url, shard_filenames, report_url, report_filename
 
     def get_release(self) -> str:
         """Return the newest release with a valid published completion report."""
@@ -84,11 +104,32 @@ class PubMedMetadataDumper(HTTPDumper):
                 f"No dated PubMed releases found at {self.SOURCE_ROOT_URL}"
             )
 
+        root_filenames = extract_index_hrefs(root_response.text)
+        manifest_filenames: tuple[str, ...] | None = None
+
+        def get_manifest_filenames() -> tuple[str, ...]:
+            nonlocal manifest_filenames
+            if manifest_filenames is None:
+                if f"{MANIFESTS_DIRECTORY}/" not in root_filenames:
+                    manifest_filenames = ()
+                else:
+                    manifests_url = urljoin(
+                        self.SOURCE_ROOT_URL, f"{MANIFESTS_DIRECTORY}/"
+                    )
+                    manifests_response = self._get(manifests_url)
+                    manifest_filenames = extract_index_hrefs(manifests_response.text)
+            return manifest_filenames
+
         for release in releases:
-            inventory = self._release_inventory(release)
+            inventory = self._release_inventory(release, get_manifest_filenames)
             if inventory is None:
                 continue
-            self.release_url, self.release_shard_filenames = inventory
+            (
+                self.release_url,
+                self.release_shard_filenames,
+                self.release_validation_report_url,
+                self.release_validation_report_filename,
+            ) = inventory
             return release
 
         raise DumperException(
@@ -123,7 +164,7 @@ class PubMedMetadataDumper(HTTPDumper):
                 )
 
         data_folder = Path(self.new_data_folder)
-        filenames = (*self.release_shard_filenames, VALIDATION_REPORT_FILENAME)
+        filenames = self.release_shard_filenames
         self.to_dump.extend(
             {
                 "remote": urljoin(self.release_url, filename),
@@ -131,12 +172,25 @@ class PubMedMetadataDumper(HTTPDumper):
             }
             for filename in filenames
         )
+        self.to_dump.append(
+            {
+                "remote": self.release_validation_report_url,
+                "local": str(data_folder / self.release_validation_report_filename),
+            }
+        )
 
     def post_dump(self, *args, **kwargs) -> None:
         """Revalidate the downloaded release before marking it successful."""
 
         try:
-            local_shard_paths(self.new_data_folder, VALIDATION_REPORT_FILENAME)
+            local_shard_paths(
+                self.new_data_folder,
+                getattr(
+                    self,
+                    "release_validation_report_filename",
+                    VALIDATION_REPORT_FILENAME,
+                ),
+            )
         except PubMedReleaseError as exc:
             raise DumperException(
                 f"Downloaded PubMed release {self.release} is invalid: {exc}"
