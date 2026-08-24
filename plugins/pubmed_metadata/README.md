@@ -69,14 +69,20 @@ remainder convention to `pubdate_raw` for partial, seasonal, and ranged dates.
 responses is the adapter's responsibility rather than an Elasticsearch mapping
 concern.
 
-Before queueing a large download, the dumper requires the release's
-`validation_report.json.gz`, verifies that it reports no errors and passes all
-structural checks, and confirms that its shard inventory matches a nonempty set
-of contiguous files beginning at shard `00000`. A release directory without a
-validation report is treated as incomplete. The report is retained alongside
-the downloaded shards for auditability and is checked again after download.
-Overall report warnings are allowed when the error list is empty and every
-required structural check passes.
+Before queueing a large download, the dumper requires either the legacy
+release-local `validation_report.json.gz` or the exact date-matched
+`manifests/validation_report-YYYYMMDD.json`. It accepts gzip-compressed and
+plain JSON reports, verifies that the report has no errors, and confirms that
+its shard inventory matches a nonempty set of numerically contiguous files
+beginning at shard `0`. Both legacy zero-padded and current unpadded
+`pubmed_metadata_<index>.ndjson.gz` names are supported. A release without
+either matching completion report is treated as incomplete; a release with a
+report that fails validation stops discovery instead of falling back to an
+older snapshot. The selected report is retained alongside the downloaded
+shards for auditability and checked again after download. `month-format` is the
+only structural check allowed to warn; every other reported structural check
+must pass. Advisory warnings outside the structure section remain allowed when
+the error list is empty.
 
 Downloads and uploads are each capped at four concurrent shards. Dumps are not
 scheduled automatically because each full snapshot is very large; an operator

@@ -1,4 +1,5 @@
 import importlib.util
+from datetime import date
 from pathlib import Path
 
 STATIC_PATH = Path(__file__).parents[1] / "plugins" / "pubmed_metadata" / "static.py"
@@ -15,3 +16,7 @@ def test_pubmed_source_uses_a_stable_release_root():
         "https://stars.renci.org/var/babel_outputs/pubmed2db/"
     )
     assert static.VALIDATION_REPORT_FILENAME == "validation_report.json.gz"
+    assert static.MANIFESTS_DIRECTORY == "manifests"
+    assert static.MANIFEST_VALIDATION_REPORT_FILENAME_FORMAT.format(
+        date(2026, 8, 21)
+    ) == "validation_report-20260821.json"

@@ -103,6 +103,20 @@ def test_shard_validation_accepts_a_contiguous_dynamic_inventory():
     )
 
 
+def test_shard_validation_accepts_unpadded_indexes_and_sorts_numerically():
+    filenames = [
+        "pubmed_metadata_2.ndjson.gz",
+        "pubmed_metadata_0.ndjson.gz",
+        "pubmed_metadata_1.ndjson.gz",
+    ]
+
+    assert release.validate_shard_filenames(filenames) == (
+        "pubmed_metadata_0.ndjson.gz",
+        "pubmed_metadata_1.ndjson.gz",
+        "pubmed_metadata_2.ndjson.gz",
+    )
+
+
 @pytest.mark.parametrize(
     "filenames",
     [
@@ -111,6 +125,10 @@ def test_shard_validation_accepts_a_contiguous_dynamic_inventory():
         [
             "pubmed_metadata_00000.ndjson.gz",
             "pubmed_metadata_00002.ndjson.gz",
+        ],
+        [
+            "pubmed_metadata_0.ndjson.gz",
+            "pubmed_metadata_00000.ndjson.gz",
         ],
     ],
 )
@@ -126,6 +144,54 @@ def test_validation_report_allows_advisory_warnings():
     )
 
     release.validate_report(validation_report(), shards)
+
+
+def test_validation_report_allows_month_format_warning_for_new_shards():
+    report = validation_report(
+        inputs={
+            "shards": [
+                "pubmed_metadata_0.ndjson.gz",
+                "pubmed_metadata_1.ndjson.gz",
+            ]
+        }
+    )
+    next(
+        check for check in report["checks_run"] if check["name"] == "month-format"
+    )["status"] = "warn"
+
+    release.validate_report(
+        report,
+        (
+            "pubmed_metadata_0.ndjson.gz",
+            "pubmed_metadata_1.ndjson.gz",
+        ),
+    )
+
+
+def test_validation_report_rejects_other_structure_warnings():
+    report = validation_report()
+    next(
+        check for check in report["checks_run"] if check["name"] == "record-fields"
+    )["status"] = "warn"
+
+    with pytest.raises(
+        release.PubMedReleaseError, match="did not pass all structure checks"
+    ):
+        release.validate_report(
+            report,
+            (
+                "pubmed_metadata_00000.ndjson.gz",
+                "pubmed_metadata_00001.ndjson.gz",
+            ),
+        )
+
+
+def test_validation_report_parses_plain_and_gzip_json():
+    report = validation_report()
+    plain_payload = json.dumps(report).encode("utf-8")
+
+    assert release.parse_validation_report(plain_payload) == report
+    assert release.parse_validation_report(gzip.compress(plain_payload)) == report
 
 
 @pytest.mark.parametrize(
@@ -160,6 +226,16 @@ def test_validation_report_allows_advisory_warnings():
                 }
             ]
         ),
+        validation_report(
+            checks_run=[
+                *validation_report()["checks_run"],
+                {
+                    "name": "month-format",
+                    "section": "structure",
+                    "status": "warn",
+                },
+            ]
+        ),
         validation_report(checks={"structure": {"records_total": 0}}),
     ],
 )
@@ -186,6 +262,25 @@ def test_local_shards_are_discovered_in_index_order(tmp_path):
         "pubmed_metadata_00001.ndjson.gz",
         "pubmed_metadata_00002.ndjson.gz",
     ]
+
+
+def test_local_unpadded_shards_use_a_plain_json_report(tmp_path):
+    shard_names = [
+        "pubmed_metadata_0.ndjson.gz",
+        "pubmed_metadata_1.ndjson.gz",
+    ]
+    for shard_name in reversed(shard_names):
+        (tmp_path / shard_name).touch()
+    report = validation_report(inputs={"shards": shard_names})
+    next(
+        check for check in report["checks_run"] if check["name"] == "month-format"
+    )["status"] = "warn"
+    report_filename = "validation_report-20260821.json"
+    (tmp_path / report_filename).write_text(json.dumps(report), encoding="utf-8")
+
+    assert [
+        path.name for path in release.local_shard_paths(tmp_path, report_filename)
+    ] == shard_names
 
 
 def test_local_shards_reject_a_missing_final_shard(tmp_path):
