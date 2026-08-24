@@ -59,7 +59,6 @@ def test_transform_namespaces_pubmed_metadata():
         "_id": "PMID:12345678",
         "pubmed": {
             "identifiers": [
-                "PMID:12345678",
                 "doi:10.1000/Example",
                 "PMC:PMC1234567",
             ],
@@ -90,10 +89,10 @@ def test_streams_gzip_ndjson(tmp_path):
     assert documents[0]["pubmed"]["abstract"].endswith("β.")
 
 
-def test_legacy_schema_defaults_identifiers_to_pmid():
+def test_legacy_schema_stores_an_empty_alternate_identifier_list():
     document = parser.transform_pubmed_metadata_record(legacy_record())
 
-    assert document["pubmed"]["identifiers"] == ["PMID:12345678"]
+    assert document["pubmed"]["identifiers"] == []
     assert "pubdate_raw" not in document["pubmed"]
 
 
@@ -109,7 +108,6 @@ def test_normalizes_well_formed_pmcid_aliases_preserving_order():
     )
 
     assert document["pubmed"]["identifiers"] == [
-        "PMID:12345678",
         "PMC:PMC7654321",
         "doi:10.1000/Example",
     ]
@@ -123,7 +121,6 @@ def test_preserves_malformed_pmcid_aliases():
     )
 
     assert document["pubmed"]["identifiers"] == [
-        "PMID:12345678",
         "PMCID:wh_2021_113",
     ]
 
@@ -142,7 +139,6 @@ def test_deduplicates_canonical_pmc_and_pmcid_alias_only():
     )
 
     assert document["pubmed"]["identifiers"] == [
-        "PMID:12345678",
         "PMC:PMC7654321",
         "doi:10.1000/Example",
         "doi:10.1000/Example",
@@ -162,10 +158,24 @@ def test_alias_collision_keeps_the_first_identifier_position():
     )
 
     assert document["pubmed"]["identifiers"] == [
-        "PMID:12345678",
         "PMC:PMC7654321",
         "doi:10.1000/Example",
     ]
+
+
+def test_removes_only_the_exact_primary_pmid_from_alternate_identifiers():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=[
+                "PMID:12345678",
+                "PMID:87654321",
+                "PMID:12345678",
+            ]
+        )
+    )
+
+    assert document["_id"] == "PMID:12345678"
+    assert document["pubmed"]["identifiers"] == ["PMID:87654321"]
 
 
 @pytest.mark.parametrize("field", ["pubdate", "pub_date"])
