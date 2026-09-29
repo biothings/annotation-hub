@@ -196,6 +196,45 @@ def new_layout_responses(*, report_status="warn", month_status="warn"):
     return responses
 
 
+def nested_manifest_responses(*, report_status="warn", exact_report=True):
+    responses = new_layout_responses()
+    new_shard_names = [
+        "pubmed_metadata_0.ndjson.gz",
+        "pubmed_metadata_1.ndjson.gz",
+    ]
+    report_filename = "validation_report-20260926.json"
+    nested_manifest_hrefs = [
+        report_filename if exact_report else "validation_report-20260925.json"
+    ]
+    responses.update(
+        {
+            ROOT_URL: FakeResponse(
+                text=index_html(
+                    "manifests/", "2026sep26/", "2026aug21/", "2026aug5/"
+                )
+            ),
+            f"{ROOT_URL}2026sep26/": FakeResponse(
+                text=index_html("manifests/", *new_shard_names)
+            ),
+            f"{ROOT_URL}2026sep26/manifests/": FakeResponse(
+                text=index_html(*nested_manifest_hrefs)
+            ),
+        }
+    )
+    if exact_report:
+        responses[
+            f"{ROOT_URL}2026sep26/manifests/{report_filename}"
+        ] = FakeResponse(
+            content=plain_report(
+                status=report_status,
+                padded=False,
+                compressed=True,
+                month_status="warn",
+            )
+        )
+    return responses
+
+
 def test_dumper_selects_newest_completed_release_and_queues_its_files(
     dumper_module,
 ):
@@ -221,6 +260,14 @@ def test_dumper_selects_newest_completed_release_and_queues_its_files(
 def test_legacy_release_does_not_require_the_manifest_index(dumper_module):
     responses = release_responses()
     responses[ROOT_URL] = FakeResponse(text=index_html("manifests/", "2026aug5/"))
+    responses[f"{ROOT_URL}2026aug5/"] = FakeResponse(
+        text=index_html(
+            "manifests/",
+            "pubmed_metadata_00000.ndjson.gz",
+            "pubmed_metadata_00001.ndjson.gz",
+            "validation_report.json.gz",
+        )
+    )
     dumper = dumper_module.PubMedMetadataDumper()
     dumper.client = FakeClient(responses)
     dumper._current_release = "2026jun30"
@@ -265,6 +312,89 @@ def test_dumper_selects_new_layout_release_and_queues_sibling_manifest(
             ),
         },
     ]
+
+
+def test_dumper_selects_release_local_nested_manifest(dumper_module):
+    responses = nested_manifest_responses()
+    responses[f"{ROOT_URL}manifests/"] = FakeResponse(
+        text=index_html(
+            "validation_report-20260821.json",
+            "validation_report-20260926.json",
+        )
+    )
+    dumper = dumper_module.PubMedMetadataDumper()
+    dumper.client = FakeClient(responses)
+    dumper._current_release = "2026aug21"
+
+    dumper.create_todump_list()
+
+    assert dumper.release == "2026sep26"
+    assert dumper.to_dump == [
+        {
+            "remote": f"{ROOT_URL}2026sep26/pubmed_metadata_0.ndjson.gz",
+            "local": str(
+                Path(dumper.new_data_folder) / "pubmed_metadata_0.ndjson.gz"
+            ),
+        },
+        {
+            "remote": f"{ROOT_URL}2026sep26/pubmed_metadata_1.ndjson.gz",
+            "local": str(
+                Path(dumper.new_data_folder) / "pubmed_metadata_1.ndjson.gz"
+            ),
+        },
+        {
+            "remote": (
+                f"{ROOT_URL}2026sep26/manifests/"
+                "validation_report-20260926.json"
+            ),
+            "local": str(
+                Path(dumper.new_data_folder)
+                / "validation_report-20260926.json"
+            ),
+        },
+    ]
+    requested_urls = [url for url, _ in dumper.client.calls]
+    assert f"{ROOT_URL}manifests/" not in requested_urls
+
+
+def test_release_local_manifest_is_authoritative(dumper_module):
+    responses = nested_manifest_responses(exact_report=False)
+    report_filename = "validation_report-20260926.json"
+    responses[f"{ROOT_URL}manifests/"] = FakeResponse(
+        text=index_html("validation_report-20260821.json", report_filename)
+    )
+    responses[f"{ROOT_URL}manifests/{report_filename}"] = FakeResponse(
+        content=plain_report(
+            status="warn",
+            padded=False,
+            compressed=True,
+            month_status="warn",
+        )
+    )
+    dumper = dumper_module.PubMedMetadataDumper()
+    dumper.client = FakeClient(responses)
+    dumper._current_release = "2026jun30"
+
+    dumper.create_todump_list()
+
+    assert dumper.release == "2026aug21"
+    requested_urls = [url for url, _ in dumper.client.calls]
+    assert f"{ROOT_URL}manifests/" in requested_urls
+    assert (
+        f"{ROOT_URL}manifests/validation_report-20260926.json"
+        not in requested_urls
+    )
+
+
+def test_completed_invalid_nested_manifest_release_never_falls_back(dumper_module):
+    dumper = dumper_module.PubMedMetadataDumper()
+    dumper.client = FakeClient(nested_manifest_responses(report_status="fail"))
+
+    with pytest.raises(dumper_module.DumperException, match="did not complete"):
+        dumper.create_todump_list()
+
+    requested_urls = [url for url, _ in dumper.client.calls]
+    assert f"{ROOT_URL}2026aug21/" not in requested_urls
 
 
 def test_completed_invalid_new_layout_release_never_falls_back(dumper_module):

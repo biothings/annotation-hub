@@ -55,7 +55,7 @@ class PubMedMetadataDumper(HTTPDumper):
     def _release_inventory(
         self,
         release: str,
-        get_manifest_filenames: Callable[[], tuple[str, ...]],
+        get_global_manifest_filenames: Callable[[], tuple[str, ...]],
     ) -> tuple[str, tuple[str, ...], str, str] | None:
         release_url = urljoin(self.SOURCE_ROOT_URL, f"{release}/")
         index_response = self._get(release_url)
@@ -68,17 +68,34 @@ class PubMedMetadataDumper(HTTPDumper):
             report_filename = MANIFEST_VALIDATION_REPORT_FILENAME_FORMAT.format(
                 release_date(release)
             )
-            if report_filename not in get_manifest_filenames():
+            if f"{MANIFESTS_DIRECTORY}/" in filenames:
+                release_manifests_url = urljoin(
+                    release_url, f"{MANIFESTS_DIRECTORY}/"
+                )
+                release_manifests_response = self._get(release_manifests_url)
+                release_manifest_filenames = extract_index_hrefs(
+                    release_manifests_response.text
+                )
+                if report_filename not in release_manifest_filenames:
+                    self.logger.info(
+                        "Ignoring incomplete PubMed release %s: "
+                        "no matching completion report",
+                        release,
+                    )
+                    return None
+                report_url = urljoin(release_manifests_url, report_filename)
+            elif report_filename in get_global_manifest_filenames():
+                report_url = urljoin(
+                    self.SOURCE_ROOT_URL,
+                    f"{MANIFESTS_DIRECTORY}/{report_filename}",
+                )
+            else:
                 self.logger.info(
                     "Ignoring incomplete PubMed release %s: "
                     "no matching completion report",
                     release,
                 )
                 return None
-            report_url = urljoin(
-                self.SOURCE_ROOT_URL,
-                f"{MANIFESTS_DIRECTORY}/{report_filename}",
-            )
 
         try:
             shard_filenames = validate_shard_filenames(filenames)
@@ -107,7 +124,7 @@ class PubMedMetadataDumper(HTTPDumper):
         root_filenames = extract_index_hrefs(root_response.text)
         manifest_filenames: tuple[str, ...] | None = None
 
-        def get_manifest_filenames() -> tuple[str, ...]:
+        def get_global_manifest_filenames() -> tuple[str, ...]:
             nonlocal manifest_filenames
             if manifest_filenames is None:
                 if f"{MANIFESTS_DIRECTORY}/" not in root_filenames:
@@ -121,7 +138,9 @@ class PubMedMetadataDumper(HTTPDumper):
             return manifest_filenames
 
         for release in releases:
-            inventory = self._release_inventory(release, get_manifest_filenames)
+            inventory = self._release_inventory(
+                release, get_global_manifest_filenames
+            )
             if inventory is None:
                 continue
             (

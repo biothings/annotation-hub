@@ -25,6 +25,10 @@ def upstream_record(**overrides):
             "doi:10.1000/Example",
             "PMC:PMC1234567",
         ],
+        "publication_types": [
+            {"id": "MESH:D016428", "name": "Journal Article"},
+            {"id": "MESH:D016454", "name": "Review"},
+        ],
         "journal_name": "Journal of Examples",
         "journal_abbrev": "J Ex",
         "article_title": "A useful example",
@@ -44,6 +48,7 @@ def upstream_record(**overrides):
 def legacy_record(**overrides):
     record = upstream_record(**overrides)
     del record["identifiers"]
+    del record["publication_types"]
     return record
 
 
@@ -61,6 +66,10 @@ def test_transform_namespaces_pubmed_metadata():
             "identifiers": [
                 "doi:10.1000/Example",
                 "PMC:PMC1234567",
+            ],
+            "publication_types": [
+                {"id": "MESH:D016428", "name": "Journal Article"},
+                {"id": "MESH:D016454", "name": "Review"},
             ],
             "journal": {
                 "name": "Journal of Examples",
@@ -93,7 +102,43 @@ def test_legacy_schema_stores_an_empty_alternate_identifier_list():
     document = parser.transform_pubmed_metadata_record(legacy_record())
 
     assert document["pubmed"]["identifiers"] == []
+    assert "publication_types" not in document["pubmed"]
     assert "pubdate_raw" not in document["pubmed"]
+
+
+def test_pre_publication_type_schema_keeps_the_field_absent():
+    record = upstream_record()
+    del record["publication_types"]
+
+    document = parser.transform_pubmed_metadata_record(record)
+
+    assert document["pubmed"]["identifiers"] == [
+        "doi:10.1000/Example",
+        "PMC:PMC1234567",
+    ]
+    assert "publication_types" not in document["pubmed"]
+
+
+def test_preserves_empty_publication_type_list():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(publication_types=[])
+    )
+
+    assert document["pubmed"]["publication_types"] == []
+
+
+def test_preserves_publication_type_order_and_blank_names():
+    publication_types = [
+        {"id": "MESH:D002363", "name": "Case Reports"},
+        {"id": "MESH:D016428", "name": ""},
+        {"id": "MESH:D016454", "name": "Review"},
+    ]
+
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(publication_types=publication_types)
+    )
+
+    assert document["pubmed"]["publication_types"] == publication_types
 
 
 def test_normalizes_well_formed_pmcid_aliases_preserving_order():
@@ -248,6 +293,44 @@ def test_exact_looking_medline_date_remains_raw_only():
 def test_rejects_invalid_records(record, message):
     with pytest.raises(parser.PubMedMetadataValidationError, match=message):
         parser.transform_pubmed_metadata_record(record)
+
+
+@pytest.mark.parametrize(
+    ("publication_types", "message"),
+    [
+        ("Review", "publication_types must be a list of objects"),
+        (["Review"], r"publication_types\[0\] must be an object"),
+        (
+            [{"id": "MESH:D016454"}],
+            r"publication_types\[0\]: missing fields: name",
+        ),
+        (
+            [{"id": "MESH:D016454", "name": "Review", "extra": "value"}],
+            r"publication_types\[0\]: unexpected fields: extra",
+        ),
+        (
+            [{"id": "", "name": "Review"}],
+            r"publication_types\[0\]: invalid publication type id ''",
+        ),
+        (
+            [{"id": "MeSH:D016454", "name": "Review"}],
+            r"publication_types\[0\]: invalid publication type id 'MeSH:D016454'",
+        ),
+        (
+            [{"id": None, "name": "Review"}],
+            r"publication_types\[0\]: invalid publication type id None",
+        ),
+        (
+            [{"id": "MESH:D016454", "name": None}],
+            r"publication_types\[0\]: name must be a string",
+        ),
+    ],
+)
+def test_rejects_invalid_publication_types(publication_types, message):
+    with pytest.raises(parser.PubMedMetadataValidationError, match=message):
+        parser.transform_pubmed_metadata_record(
+            upstream_record(publication_types=publication_types)
+        )
 
 
 @pytest.mark.parametrize(

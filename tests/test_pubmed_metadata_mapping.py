@@ -34,6 +34,15 @@ def test_metadata_fields_are_searchable_and_sortable():
         "type": "keyword",
         "normalizer": "keyword_lowercase_normalizer",
     }
+    assert properties["publication_types"] == {
+        "properties": {
+            "id": {
+                "type": "keyword",
+                "normalizer": "keyword_lowercase_normalizer",
+            },
+            "name": {"type": "keyword"},
+        }
+    }
 
 
 def test_verbatim_pubdate_is_source_only():

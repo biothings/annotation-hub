@@ -21,6 +21,8 @@ BASE_RECORD_FIELDS = (
     "abstract",
 )
 IDENTIFIERS_FIELD = "identifiers"
+PUBLICATION_TYPES_FIELD = "publication_types"
+PUBLICATION_TYPE_FIELDS = frozenset({"id", "name"})
 # pubmed2db PR #17 currently uses ``pub_date`` for the verbatim value, while
 # ``pubdate`` is under consideration to match NCBI. Accept either upstream name
 # during that transition, but always store the verbatim value as ``pubdate_raw``
@@ -30,9 +32,11 @@ PUBDATE_INPUT_FIELDS = ("pubdate", "pub_date")
 BASE_RECORD_FIELD_SET = frozenset(BASE_RECORD_FIELDS)
 ALLOWED_RECORD_FIELDS = BASE_RECORD_FIELD_SET | {
     IDENTIFIERS_FIELD,
+    PUBLICATION_TYPES_FIELD,
     *PUBDATE_INPUT_FIELDS,
 }
 PMID_PATTERN = re.compile(r"^PMID:[1-9][0-9]*$")
+PUBLICATION_TYPE_ID_PATTERN = re.compile(r"^MESH:D[0-9]+$")
 PMCID_ALIAS_PATTERN = re.compile(r"^PMCID:(PMC[0-9]+)$")
 CANONICAL_PMC_PATTERN = re.compile(r"^PMC:PMC[0-9]+$")
 YEAR_PATTERN = re.compile(r"^[0-9]{4}$")
@@ -153,6 +157,58 @@ def _validated_identifiers(record: dict, pubmed_id: str, location: str) -> list[
     return identifiers
 
 
+def _validated_publication_types(record: dict, location: str) -> list[dict[str, str]]:
+    """Return ordered PubMed publication types after validating their shape."""
+
+    publication_types = record[PUBLICATION_TYPES_FIELD]
+    if not isinstance(publication_types, list):
+        raise PubMedMetadataValidationError(
+            f"{location}: publication_types must be a list of objects"
+        )
+
+    validated: list[dict[str, str]] = []
+    for index, publication_type in enumerate(publication_types):
+        item_location = f"{location}: publication_types[{index}]"
+        if not isinstance(publication_type, dict):
+            raise PubMedMetadataValidationError(
+                f"{item_location} must be an object"
+            )
+
+        actual_fields = set(publication_type)
+        missing_fields = sorted(PUBLICATION_TYPE_FIELDS - actual_fields)
+        extra_fields = sorted(
+            str(field) for field in actual_fields - PUBLICATION_TYPE_FIELDS
+        )
+        if missing_fields or extra_fields:
+            details = []
+            if missing_fields:
+                details.append(f"missing fields: {', '.join(missing_fields)}")
+            if extra_fields:
+                details.append(f"unexpected fields: {', '.join(extra_fields)}")
+            raise PubMedMetadataValidationError(
+                f"{item_location}: {'; '.join(details)}"
+            )
+
+        publication_type_id = publication_type["id"]
+        publication_type_name = publication_type["name"]
+        if (
+            not isinstance(publication_type_id, str)
+            or PUBLICATION_TYPE_ID_PATTERN.fullmatch(publication_type_id) is None
+        ):
+            raise PubMedMetadataValidationError(
+                f"{item_location}: invalid publication type id "
+                f"{publication_type_id!r}"
+            )
+        if not isinstance(publication_type_name, str):
+            raise PubMedMetadataValidationError(
+                f"{item_location}: name must be a string"
+            )
+        validated.append(
+            {"id": publication_type_id, "name": publication_type_name}
+        )
+    return validated
+
+
 def _normalize_identifiers(identifiers: list[str]) -> list[str]:
     """Canonicalize well-formed PMCID aliases without disturbing other values."""
 
@@ -233,6 +289,10 @@ def transform_pubmed_metadata_record(
         "iss": record["issue"],
         "abstract": record["abstract"],
     }
+    if PUBLICATION_TYPES_FIELD in record:
+        pubmed[PUBLICATION_TYPES_FIELD] = _validated_publication_types(
+            record, location
+        )
     if pubdate_field is not None:
         pubmed["pubdate_raw"] = record[pubdate_field]
 
