@@ -34,6 +34,15 @@ PUBMED_METADATA_MAPPING = {
                 "type": "keyword",
                 "normalizer": "keyword_lowercase_normalizer",
             },
+            "publication_types": {
+                "properties": {
+                    "id": {
+                        "type": "keyword",
+                        "normalizer": "keyword_lowercase_normalizer",
+                    },
+                    "name": {"type": "keyword"},
+                },
+            },
             "journal": {
                 "properties": {
                     "name": _sortable_text(),
