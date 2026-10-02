@@ -96,10 +96,10 @@ def worker_module(monkeypatch, tmp_path):
 
     static_module = types.ModuleType(f"{package_name}.static")
     static_module.CONFLATION_LOOKUP_DATABASE = "conflation.sqlite3"
-    static_module.DRUG_CHEMICAL_IDENTIFIER_FILES = set()
+    static_module.DRUG_CHEMICAL_IDENTIFIER_FILES = {"Food.txt"}
     static_module.GENE_PROTEIN_IDENTIFER_FILES = set()
     static_module.IDENTIFIER_LOOKUP_DATABASE = "identifier.sqlite3"
-    static_module.NODENORM_UPLOAD_CHUNKS = {}
+    static_module.NODENORM_UPLOAD_CHUNK_OVERRIDES = {"Protein.txt": 7}
     monkeypatch.setitem(sys.modules, f"{package_name}.static", static_module)
 
     spec = importlib.util.spec_from_file_location(
@@ -110,6 +110,93 @@ def worker_module(monkeypatch, tmp_path):
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def write_worker_release(data_folder, compendia):
+    data_folder.mkdir(parents=True, exist_ok=True)
+    conflations = ("DrugChemical.txt", "GeneProtein.txt")
+    for filename in (*compendia, *conflations):
+        (data_folder / filename).write_text("{}\n", encoding="utf-8")
+    (data_folder / "release-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "release": "2026jul22",
+                "compendia": list(compendia),
+                "conflations": list(conflations),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_offset_tasks_follow_manifest_inventory(worker_module, monkeypatch, tmp_path):
+    compendia = ("CellLine.txt", "Food.txt", "FutureType.txt", "Protein.txt")
+    write_worker_release(tmp_path, compendia)
+    (tmp_path / "Protein.txt.00").write_text("split copy\n", encoding="utf-8")
+    (tmp_path / "RemovedType.txt").write_text("stale copy\n", encoding="utf-8")
+
+    analyzed = []
+
+    def offsets(input_file, num_partitions):
+        analyzed.append((Path(input_file).name, num_partitions))
+        return [0, 10]
+
+    monkeypatch.setattr(worker_module, "generate_file_offsets", offsets)
+
+    tasks = list(worker_module._build_offset_tasks(tmp_path, "collection"))
+
+    assert set(analyzed) == {
+        ("CellLine.txt", 1),
+        ("Food.txt", 1),
+        ("FutureType.txt", 1),
+        ("Protein.txt", 7),
+    }
+    assert {Path(task["input_file"]).name for task in tasks} == set(compendia)
+    assert all(task["collection_name"] == "collection" for task in tasks)
+    assert all(task["offset_start"] == 0 for task in tasks)
+    assert all(task["offset_end"] == 10 for task in tasks)
+
+    tasks_by_file = {Path(task["input_file"]).name: task for task in tasks}
+    assert (
+        tasks_by_file["Food.txt"]["conflation_database"]
+        == (tmp_path / "conflation.sqlite3").resolve()
+    )
+    assert tasks_by_file["CellLine.txt"]["conflation_database"] is None
+
+
+def test_offset_tasks_fail_before_analysis_without_manifest(
+    worker_module, monkeypatch, tmp_path
+):
+    analyzed = []
+    monkeypatch.setattr(
+        worker_module,
+        "generate_file_offsets",
+        lambda *_args, **_kwargs: analyzed.append(True),
+    )
+
+    with pytest.raises(ValueError, match="Unable to read NodeNorm release manifest"):
+        list(worker_module._build_offset_tasks(tmp_path, "collection"))
+
+    assert analyzed == []
+
+
+def test_offset_tasks_fail_before_analysis_when_manifest_file_is_missing(
+    worker_module, monkeypatch, tmp_path
+):
+    write_worker_release(tmp_path, ("Food.txt", "CellLine.txt"))
+    (tmp_path / "Food.txt").unlink()
+    analyzed = []
+    monkeypatch.setattr(
+        worker_module,
+        "generate_file_offsets",
+        lambda *_args, **_kwargs: analyzed.append(True),
+    )
+
+    with pytest.raises(ValueError, match="missing: Food.txt"):
+        list(worker_module._build_offset_tasks(tmp_path, "collection"))
+
+    assert analyzed == []
 
 
 class FakeBulkWriteResult:
@@ -697,6 +784,27 @@ def test_invalid_validation_mode_fails_before_upload_work(worker_module, monkeyp
     assert calls == []
 
 
+def test_missing_manifest_fails_before_upload_work(
+    worker_module, monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "_configure_sqlite_tmpdir",
+        lambda: calls.append("configure-sqlite"),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "create_identifiers_table",
+        lambda _path: calls.append("create-identifiers"),
+    )
+
+    with pytest.raises(ValueError, match="Unable to read NodeNorm release manifest"):
+        worker_module.upload_process(tmp_path, "collection")
+
+    assert calls == []
+
+
 def test_upload_raises_original_identifier_writer_error(worker_module, monkeypatch):
     writer_error = sqlite3.OperationalError("identifier database is full")
     worker_error = RuntimeError("Identifier writer failed; aborting upload worker")
@@ -780,7 +888,12 @@ def test_upload_raises_original_identifier_writer_error(worker_module, monkeypat
     monkeypatch.setattr(
         worker_module,
         "_build_offset_tasks",
-        lambda _data_folder, _collection: iter(({},)),
+        lambda _data_folder, _collection, input_files=None: iter(({},)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "local_compendium_paths",
+        lambda _data_folder: (Path("input.txt"),),
     )
 
     post_upload_calls = []

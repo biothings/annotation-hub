@@ -1,6 +1,4 @@
-"""
-Static defintions for urls and file locations
-"""
+"""Static URLs and performance/semantic overrides for the NodeNorm loader."""
 
 CONFLATION_LOOKUP_DATABASE = "conflation.sqlite3"
 IDENTIFIER_LOOKUP_DATABASE = "identifier.sqlite3"
@@ -8,31 +6,12 @@ BABEL_OUTPUT_ROOT = "https://stars.renci.org/var/babel_outputs"
 VERSION_URL = f"{BABEL_OUTPUT_ROOT}/latest/VERSION.txt"
 
 
-NODENORM_FILE_COLLECTION = [
-    "AnatomicalEntity.txt",
-    "BiologicalProcess.txt",
-    "Cell.txt",
-    "CellularComponent.txt",
-    "ChemicalEntity.txt",
-    "ChemicalMixture.txt",
-    "ComplexMolecularMixture.txt",
-    "Disease.txt",
-    "Drug.txt",
-    "GeneFamily.txt",
-    "GrossAnatomicalStructure.txt",
-    "MacromolecularComplex.txt",
-    "MolecularActivity.txt",
-    "OrganismTaxon.txt",
-    "Pathway.txt",
-    "PhenotypicFeature.txt",
-    "Polypeptide.txt",
-    "umls.txt",
-]
-
 NODENORM_CONFLATION_COLLECTION = ["DrugChemical.txt", "GeneProtein.txt"]
 
 
-NODENORM_BIG_FILE_COLLECTION = {
+# These maps tune concurrency only. Artifact inclusion comes from the selected
+# Babel release manifest, so a new compendium is never excluded by this file.
+NODENORM_LARGE_DOWNLOAD_CHUNK_OVERRIDES = {
     "MolecularMixture.txt": 50,
     "Gene.txt": 75,
     "Publication.txt": 100,
@@ -47,32 +26,22 @@ DRUG_CHEMICAL_IDENTIFIER_FILES = [
     "ComplexMolecularMixture.txt",
     "MolecularMixture.txt",
     "Protein.txt",
+    "Food.txt",
 ]
 
 
 GENE_PROTEIN_IDENTIFER_FILES = ["Protein.txt", "Gene.txt"]
 
 
-NODENORM_UPLOAD_CHUNKS = {
-    "AnatomicalEntity.txt": 1,
-    "BiologicalProcess.txt": 1,
-    "Cell.txt": 1,
-    "CellularComponent.txt": 1,
+NODENORM_UPLOAD_CHUNK_OVERRIDES = {
     "ChemicalEntity.txt": 10,
-    "ChemicalMixture.txt": 1,
-    "ComplexMolecularMixture.txt": 1,
     "Disease.txt": 10,
     "Drug.txt": 10,
     "Gene.txt": 30,
-    "GeneFamily.txt": 1,
-    "GrossAnatomicalStructure.txt": 1,
-    "MacromolecularComplex.txt": 1,
     "MolecularActivity.txt": 10,
     "MolecularMixture.txt": 30,
     "OrganismTaxon.txt": 10,
-    "Pathway.txt": 1,
     "PhenotypicFeature.txt": 10,
-    "Polypeptide.txt": 1,
     "Protein.txt": 50,
     "Publication.txt": 30,
     "SmallMolecule.txt": 40,

@@ -143,7 +143,10 @@ The better progress signal is parent task completion:
 Task 89 completed | Update 729236 identifiers | Total identifiers 87331569
 ```
 
-There are approximately 251 upload shard tasks, based on `NODENORM_UPLOAD_CHUNKS`. At task 89, the upload was only about 36 percent complete by shard count, yet memory was already near the earlier peak. That strongly supports the memory retention diagnosis.
+There were approximately 251 upload shard tasks under the file-specific chunk
+settings used for this run. At task 89, the upload was only about 36 percent
+complete by shard count, yet memory was already near the earlier peak. That
+strongly supports the memory retention diagnosis.
 
 ## Root Cause in the Former Design
 

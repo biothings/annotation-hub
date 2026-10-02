@@ -15,13 +15,21 @@ from biothings.hub.dataload.dumper import DumperException, LastModifiedHTTPDumpe
 from biothings.utils.manager import JobManager
 from requests import exceptions as requests_exceptions
 
-from .release import NodeNormReleaseError, parse_version_marker, validate_release
+from .release import (
+    NodeNormReleaseError,
+    artifact_filenames_from_index,
+    local_compendium_paths,
+    make_release_manifest,
+    parse_version_marker,
+    read_release_manifest,
+    validate_release,
+    write_release_manifest,
+)
 from .static import (
     BABEL_OUTPUT_ROOT,
     CONFLATION_LOOKUP_DATABASE,
-    NODENORM_BIG_FILE_COLLECTION,
     NODENORM_CONFLATION_COLLECTION,
-    NODENORM_FILE_COLLECTION,
+    NODENORM_LARGE_DOWNLOAD_CHUNK_OVERRIDES,
     VERSION_URL,
 )
 
@@ -44,9 +52,9 @@ class NodeNormDumper(LastModifiedHTTPDumper):
     VERSION_URL = VERSION_URL
     SOURCE_ROOT_URL = BABEL_OUTPUT_ROOT
     VERSION_REQUEST_TIMEOUT = 30
+    ARTIFACT_INDEX_REQUEST_TIMEOUT = 30
 
-    FILE_COLLECTION = NODENORM_FILE_COLLECTION
-    BIG_FILE_COLLECTION = NODENORM_BIG_FILE_COLLECTION
+    LARGE_DOWNLOAD_CHUNK_OVERRIDES = NODENORM_LARGE_DOWNLOAD_CHUNK_OVERRIDES
     CONFLATION_COLLECTION = NODENORM_CONFLATION_COLLECTION
 
     MAX_PARALLEL_NORMAL_FILES = 4
@@ -68,39 +76,111 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         super().__init__(src_name, src_root_folder, log_folder, archive)
         self.to_dump_large = []
 
+    def _get_artifact_filenames(
+        self, release_url: str, artifact_directory: str
+    ) -> tuple[str, ...]:
+        index_url = f"{release_url}/{artifact_directory}/"
+        response = None
+        try:
+            response = self.client.get(
+                index_url,
+                timeout=self.ARTIFACT_INDEX_REQUEST_TIMEOUT,
+            )
+            if response.status_code >= 400:
+                raise DumperException(
+                    f"Unable to read NodeNorm {artifact_directory} inventory "
+                    f"'{index_url}' (status: {response.status_code}, "
+                    f"reason: {response.reason})"
+                )
+            try:
+                return artifact_filenames_from_index(response.text)
+            except NodeNormReleaseError as exc:
+                raise DumperException(
+                    f"Invalid NodeNorm {artifact_directory} inventory "
+                    f"'{index_url}': {exc}"
+                ) from exc
+        except requests_exceptions.RequestException as exc:
+            raise DumperException(
+                f"Unable to read NodeNorm {artifact_directory} inventory "
+                f"'{index_url}': {exc}"
+            ) from exc
+        finally:
+            if response is not None:
+                response.close()
+
     def create_todump_list(self, force: bool = False) -> None:
         self.to_dump = []
         self.to_dump_large = []
         self.set_release()
 
+        release_url = f"{self.SOURCE_ROOT_URL}/{self.release}"
+        compendia = self._get_artifact_filenames(release_url, "compendia")
+        conflations = self._get_artifact_filenames(release_url, "conflation")
+        configured_conflations = set(self.CONFLATION_COLLECTION)
+        if set(conflations) != configured_conflations:
+            missing = sorted(configured_conflations - set(conflations))
+            unsupported = sorted(set(conflations) - configured_conflations)
+            details = []
+            if missing:
+                details.append("missing: " + ", ".join(missing))
+            if unsupported:
+                details.append("unsupported: " + ", ".join(unsupported))
+            raise DumperException(
+                "Babel conflation inventory does not match the NodeNorm loader "
+                f"({'; '.join(details)})"
+            )
+        self.release_manifest = make_release_manifest(
+            self.release, compendia, conflations
+        )
+
         if not force and self.current_release:
             try:
                 validate_release(self.current_release)
                 if self.release == self.current_release:
-                    self.logger.info(
-                        "NodeNorm release %s is already current",
+                    current_data_folder = Path(self.current_data_folder)
+                    current_manifest = read_release_manifest(current_data_folder)
+                    if current_manifest == self.release_manifest:
+                        local_compendium_paths(current_data_folder)
+                        self.logger.info(
+                            "NodeNorm release %s and its artifact inventory are "
+                            "already current",
+                            self.release,
+                        )
+                        return
+                    self.logger.warning(
+                        "NodeNorm release %s has a changed artifact inventory; "
+                        "rebuilding it",
                         self.release,
                     )
-                    return
             except NodeNormReleaseError:
                 self.logger.warning(
-                    "Current NodeNorm release %r is invalid; downloading %s",
+                    "Current NodeNorm release %r or its local artifact inventory is "
+                    "invalid; downloading %s",
                     self.current_release,
                     self.release,
                 )
 
-        release_url = f"{self.SOURCE_ROOT_URL}/{self.release}"
         local_datafolder = Path(self.new_data_folder)
 
-        for nodenorm_file in self.FILE_COLLECTION:
-            self.to_dump.append(
-                {
-                    "remote": f"{release_url}/compendia/{nodenorm_file}",
-                    "local": str(local_datafolder.joinpath(nodenorm_file)),
-                }
-            )
+        for nodenorm_file in self.release_manifest.compendia:
+            file_partitions = self.LARGE_DOWNLOAD_CHUNK_OVERRIDES.get(nodenorm_file)
+            if file_partitions is None:
+                self.to_dump.append(
+                    {
+                        "remote": f"{release_url}/compendia/{nodenorm_file}",
+                        "local": str(local_datafolder.joinpath(nodenorm_file)),
+                    }
+                )
+            else:
+                self.to_dump_large.append(
+                    {
+                        "remoteurl": f"{release_url}/compendia/{nodenorm_file}",
+                        "localfile": str(local_datafolder.joinpath(nodenorm_file)),
+                        "num_partitions": file_partitions,
+                    }
+                )
 
-        for nodenorm_file in self.CONFLATION_COLLECTION:
+        for nodenorm_file in self.release_manifest.conflations:
             self.to_dump.append(
                 {
                     "remote": f"{release_url}/conflation/{nodenorm_file}",
@@ -108,28 +188,19 @@ class NodeNormDumper(LastModifiedHTTPDumper):
                 }
             )
 
-        for nodenorm_file, file_partitions in self.BIG_FILE_COLLECTION.items():
-            self.to_dump_large.append(
-                {
-                    "remoteurl": f"{release_url}/compendia/{nodenorm_file}",
-                    "localfile": str(local_datafolder.joinpath(nodenorm_file)),
-                    "num_partitions": file_partitions,
-                }
-            )
-
     @override
     async def do_dump(self, job_manager: JobManager = None):
         await self._handle_normal_size_files(job_manager)
         await self._handle_large_size_files(job_manager)
+        write_release_manifest(self.new_data_folder, self.release_manifest)
+        local_compendium_paths(self.new_data_folder)
         self.logger.info("%s successfully downloaded", self.SRC_NAME)
 
     async def _handle_normal_size_files(self, job_manager: JobManager):
         self.logger.info("%d file(s) to download (normal size)", len(self.to_dump))
         self.unprepare()
 
-        for batch_start in range(
-            0, len(self.to_dump), self.MAX_PARALLEL_NORMAL_FILES
-        ):
+        for batch_start in range(0, len(self.to_dump), self.MAX_PARALLEL_NORMAL_FILES):
             jobs = []
             batch = self.to_dump[
                 batch_start : batch_start + self.MAX_PARALLEL_NORMAL_FILES
@@ -530,6 +601,20 @@ class NodeNormDumper(LastModifiedHTTPDumper):
 
     def post_dump(self, *args, **kwargs):
         data_directory = Path(self.new_data_folder)
+        expected_release = getattr(self, "release", None) or self.current_release
+        try:
+            validate_release(expected_release)
+            manifest = read_release_manifest(data_directory)
+            if manifest.release != expected_release:
+                raise NodeNormReleaseError(
+                    f"local manifest release {manifest.release!r} does not match "
+                    f"selected release {expected_release!r}"
+                )
+            local_compendium_paths(data_directory)
+        except NodeNormReleaseError as exc:
+            raise DumperException(
+                f"Downloaded NodeNorm release {expected_release} is invalid: {exc}"
+            ) from exc
         self._generate_conflation_database(data_directory)
         super().post_dump(*args, **kwargs)
 

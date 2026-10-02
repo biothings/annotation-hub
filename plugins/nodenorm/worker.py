@@ -2,6 +2,7 @@ import concurrent.futures
 import hashlib
 import itertools
 import json
+import math
 import multiprocessing
 import os
 import queue
@@ -22,12 +23,13 @@ from biothings.utils.serializer import json_loads
 from biothings.utils.hub_db import get_src_db
 from biothings.utils.common import iter_n
 
+from .release import local_compendium_paths
 from .static import (
     CONFLATION_LOOKUP_DATABASE,
     DRUG_CHEMICAL_IDENTIFIER_FILES,
     GENE_PROTEIN_IDENTIFER_FILES,
     IDENTIFIER_LOOKUP_DATABASE,
-    NODENORM_UPLOAD_CHUNKS,
+    NODENORM_UPLOAD_CHUNK_OVERRIDES,
 )
 
 logger = config.logger
@@ -37,6 +39,8 @@ NODENORM_VALIDATION_FAILURE_SAMPLE_SIZE = 20
 NODENORM_VALIDATION_BATCH_SIZE = 100
 NODENORM_VALIDATION_PROGRESS_INTERVAL = 10_000
 NODENORM_VALIDATION_MONGO_ATTEMPTS = 3
+NODENORM_UPLOAD_TARGET_PARTITION_BYTES = 512 * 1024 * 1024
+NODENORM_UPLOAD_MAX_PARTITIONS = 50
 NODENORM_IDENTIFIER_SHARD_COUNT = 8
 NODENORM_IDENTIFIER_BATCH_SIZE = 100_000
 NODENORM_IDENTIFIER_SHARD_QUEUE_SIZE = 60
@@ -111,6 +115,7 @@ def _configure_sqlite_tmpdir() -> Path:
 
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     validation_mode = _curie_validation_mode()
+    compendium_paths = local_compendium_paths(data_folder)
     _configure_sqlite_tmpdir()
 
     create_identifiers_table(data_folder)
@@ -154,7 +159,11 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
             process_futures = set()
             try:
                 for index, task in enumerate(
-                    _build_offset_tasks(data_folder, collection_name)
+                    _build_offset_tasks(
+                        data_folder,
+                        collection_name,
+                        input_files=compendium_paths,
+                    )
                 ):
                     future = executor.submit(subset_upload_worker, **task)
                     process_futures.add(future)
@@ -246,7 +255,11 @@ def _configure_identifier_writer(identifier_queues, identifier_writer_failed):
     IDENTIFIER_WRITER_FAILED = identifier_writer_failed
 
 
-def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
+def _build_offset_tasks(
+    data_folder: Union[str, Path],
+    collection_name: str,
+    input_files: tuple[Path, ...] | None = None,
+):
     """
     Reads every file and builds an index file compiling the offset ranges
     we want to read as a subset of the file processing.
@@ -289,10 +302,24 @@ def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
             argument_collection.append(arguments)
         return argument_collection
 
+    if input_files is None:
+        input_files = local_compendium_paths(data_folder)
     thread_futures = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        for filename, num_partitions in NODENORM_UPLOAD_CHUNKS.items():
-            filepath = Path(data_folder).joinpath(filename).resolve().absolute()
+        for filepath in input_files:
+            filepath = filepath.resolve().absolute()
+            num_partitions = NODENORM_UPLOAD_CHUNK_OVERRIDES.get(filepath.name)
+            if num_partitions is None:
+                num_partitions = max(
+                    1,
+                    min(
+                        NODENORM_UPLOAD_MAX_PARTITIONS,
+                        math.ceil(
+                            filepath.stat().st_size
+                            / NODENORM_UPLOAD_TARGET_PARTITION_BYTES
+                        ),
+                    ),
+                )
             arguments = {"input_file": filepath, "num_partitions": num_partitions}
             future = executor.submit(_populate_upload_arguments, **arguments)
             thread_futures.append(future)
