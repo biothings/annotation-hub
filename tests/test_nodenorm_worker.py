@@ -1139,9 +1139,8 @@ def test_protein_wins_equal_curie_set_tie(worker_module, monkeypatch):
 
 def test_two_shared_curies_report_one_correction(worker_module, monkeypatch):
     """
-    Both CURIEs resolve to the same pair of documents, so the batch queues two
-    delete requests that apply once. Counting the buffer reported two
-    corrections; the write result reports the one document that changed.
+    The first CURIE deletes the subset document. Re-reading for the second CURIE
+    finds that its duplicate is already resolved, so only one write is needed.
     """
     collection = install_fake_collection(
         worker_module,
@@ -1155,7 +1154,7 @@ def test_two_shared_curies_report_one_correction(worker_module, monkeypatch):
     task_id, corrections, unresolved = run_batch(worker_module, ["CURIE:x", "CURIE:y"])
 
     assert (task_id, corrections, unresolved) == (0, 1, 0)
-    assert len(collection.bulk_write_calls[0]) == 2, "two requests were issued"
+    assert [len(requests) for requests in collection.bulk_write_calls] == [1]
     assert collection.stored("drop") is None
     assert collection.duplicated_curies() == set()
 
@@ -1241,35 +1240,38 @@ def test_trim_does_not_clobber_a_document_changed_underneath_it(
     assert collection.curies("d1") == ["CURIE:dupe"]
 
 
-def test_composed_pulls_never_empty_a_document(worker_module, monkeypatch):
+@pytest.mark.parametrize(
+    "curies",
+    [
+        pytest.param(["CURIE:x", "CURIE:y"], id="x-then-y"),
+        pytest.param(["CURIE:y", "CURIE:x"], id="y-then-x"),
+    ],
+)
+def test_dependent_repairs_re_read_between_curies(worker_module, monkeypatch, curies):
     """
     One document sharing a different CURIE with each of two Protein cliques.
 
-    Each pull spares an identifier when judged against the snapshot it was planned
-    from, so a per-CURIE check passes both, and applying both empties the document.
-    The guard is restated in the filter so the server re-evaluates it at write
-    time; the second pull matches nothing and the document keeps an identifier.
+    Planning both repairs from one snapshot queues two pulls. MongoDB declines the
+    second pull to avoid emptying the shared document, which leaves that CURIE
+    duplicated. Applying the first repair before reading the second makes the
+    second decision from current state, so it deletes the now-redundant document.
     """
     collection = install_fake_collection(
         worker_module,
         monkeypatch,
         [
             identifier_document("side", "CURIE:x", "CURIE:y"),
-            identifier_document(
-                "px", "CURIE:x", "CURIE:px", node_type="biolink:Protein"
-            ),
-            identifier_document(
-                "py", "CURIE:y", "CURIE:py", node_type="biolink:Protein"
-            ),
+            identifier_document("px", "CURIE:x", node_type="biolink:Protein"),
+            identifier_document("py", "CURIE:y", node_type="biolink:Protein"),
         ],
     )
 
-    task_id, corrections, unresolved = run_batch(worker_module, ["CURIE:x", "CURIE:y"])
+    task_id, corrections, unresolved = run_batch(worker_module, curies)
 
-    assert collection.curies("side") != [], "the side document was emptied"
-    assert len(collection.curies("side")) == 1
-    assert (task_id, corrections, unresolved) == (0, 1, 0)
-    assert len(collection.bulk_write_calls[0]) == 2, "two pulls were issued"
+    assert collection.stored("side") is None
+    assert (task_id, corrections, unresolved) == (0, 2, 0)
+    assert [len(requests) for requests in collection.bulk_write_calls] == [1, 1]
+    assert collection.duplicated_curies() == set()
 
 
 def test_repair_rejects_an_emptied_surviving_document(worker_module, monkeypatch):

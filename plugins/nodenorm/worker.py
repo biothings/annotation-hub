@@ -826,13 +826,12 @@ def cleanup_curie_duplication(
     total_correction_count = 0
     total_unresolved_count = 0
 
-    # Pair repairs make decisions from both documents but MongoDB applies each
-    # write to only one of them. If batches overlap, one can therefore act on a
-    # keeper snapshot that another batch has since changed or deleted. Stable
-    # sorting does not solve that write skew. Upload into the temporary collection
-    # is complete at this point, so stream and finish one batch before the next one
-    # reads. Do not parallelize this loop without re-reading and writing while all
-    # documents involved in a repair are locked together.
+    # Pair repairs can change documents that a later CURIE depends on. Keep this
+    # loop serial, and have the handler apply each candidate before reading the
+    # next one. The 1,000-CURIE chunks only amortize connection and progress
+    # bookkeeping; they are not planned from one shared database snapshot. Do not
+    # parallelize this loop without re-reading and writing while all documents
+    # involved in a repair are locked together.
     try:
         duplicate_curies = _iter_duplicate_curies(data_folder)
         for index, curie_batch in enumerate(iter_n(duplicate_curies, 1000)):
@@ -1320,10 +1319,14 @@ def _curie_duplication_batch_handler(
     `curies` holds the sqlite rows streamed by `_iter_duplicate_curies`, so each
     entry is a row tuple whose first column is the CURIE.
 
+    Each candidate is read, planned, and applied before the next candidate is
+    read. Although callers provide 1,000-CURIE chunks, dependent repairs must see
+    the changes made earlier in the same chunk.
+
     Returns the number of operations MongoDB reports as applied and the number of
     CURIEs no strategy could resolve. The corrections figure comes from the write
-    result rather than the size of the request buffer, because two CURIEs shared
-    by the same pair of documents queue two requests that apply once.
+    results rather than the number of candidates, because an earlier repair can
+    also satisfy a later candidate.
     """
 
     num_retry = 10
@@ -1353,15 +1356,18 @@ def _curie_duplication_batch_handler(
                 num_retry - counter,
             )
 
-    # Trims are kept apart from pair repairs so their matched count remains useful.
-    # They are also coalesced by document below because one trim removes every
-    # repeated CURIE in that identifier array. Final validation, rather than a CAS
-    # miss alone, determines whether any repeat survived.
-    trim_operations = {}
-    pair_operations = []
     inspected_document_ids = set()
     unresolved_count = 0
+    request_count = 0
+    correction_count = 0
     for result in curies:
+        # Apply this candidate before reading the next one. A repair can remove a
+        # CURIE or delete a document that another candidate in this chunk shares.
+        # Planning every request first would make that later decision from a stale
+        # snapshot and can leave a duplicate behind.
+        trim_operations = {}
+        pair_operations = []
+
         # Named distinctly from the identifier documents inspected below, which
         # otherwise shadow it
         duplicate_curie = result[0]
@@ -1376,11 +1382,10 @@ def _curie_duplication_batch_handler(
             )
             if not unresolved and operation is not None:
                 # One trim deduplicates every CURIE in the document. Coalescing by
-                # _id prevents later candidates from queueing the same CAS again
-                # and turning an already-resolved no-op into a false unresolved.
+                # _id avoids duplicate trims if this candidate reaches the same
+                # surviving document through more than one path.
                 trim_operations.setdefault(documents[0]["_id"], operation)
             operation = None
-            operations = pair_operations
         # Handle case where the identifier.i is spread across 2 documents
         elif len(documents) == 2:
             operation, unresolved, surviving_documents = _resolve_document_pair(
@@ -1394,12 +1399,11 @@ def _curie_duplication_batch_handler(
                     trim_operations.setdefault(
                         surviving_document["_id"], trim_operation
                     )
-            operations = pair_operations
         # A CURIE the identifier shards counted more than once should be found in
         # 1 or 2 documents. Anything else is outside what the branches above can
         # reason about, so leave the documents as they are and report it.
         else:
-            operation, unresolved, operations = None, True, pair_operations
+            operation, unresolved = None, True
             logger.critical(
                 "[Task %d] Unable to resolve duplicate CURIE %s: found in %d "
                 "document(s), expected 1 or 2",
@@ -1411,39 +1415,50 @@ def _curie_duplication_batch_handler(
         if unresolved:
             unresolved_count += 1
         elif operation is not None:
-            operations.append(operation)
+            pair_operations.append(operation)
 
-    trim_requests = list(trim_operations.values())
-    request_count = len(trim_requests) + len(pair_operations)
+        # Trims stay apart from the pair repair so their matched count remains
+        # useful, and they run first because the pair operation was planned from
+        # the identifiers read above. Final validation, rather than a CAS miss
+        # alone, determines whether any repeat survived.
+        trim_requests = list(trim_operations.values())
+        candidate_request_count = len(trim_requests) + len(pair_operations)
+        request_count += candidate_request_count
+        if candidate_request_count == 0:
+            continue
+
+        logger.debug(
+            "[Task %d] Writing %s change(s) for duplicate CURIE %s",
+            task_id,
+            candidate_request_count,
+            duplicate_curie,
+        )
+
+        if trim_requests:
+            trim_result = collection.bulk_write(trim_requests)
+            correction_count += trim_result.modified_count
+            # A miss is not automatically unresolved: another repair may already
+            # have deduplicated the same document. The direct validation pass below
+            # is authoritative, so report misses here without guessing their state.
+            missed_trim_count = len(trim_requests) - trim_result.matched_count
+            if missed_trim_count > 0:
+                logger.warning(
+                    "[Task %d] %d repeated-CURIE trim(s) did not apply because "
+                    "their document changed underneath them; final validation "
+                    "will recheck",
+                    task_id,
+                    missed_trim_count,
+                )
+
+        if pair_operations:
+            pair_result = collection.bulk_write(pair_operations)
+            correction_count += pair_result.deleted_count + pair_result.modified_count
+
     if request_count == 0:
         logger.debug(
             "[Task %d] Bulk writing found no changes to collection to apply", task_id
         )
         return task_id, 0, unresolved_count
-
-    logger.debug(
-        "[Task %d] Bulk writing %s changes to collection", task_id, request_count
-    )
-    correction_count = 0
-
-    if trim_requests:
-        trim_result = collection.bulk_write(trim_requests)
-        correction_count += trim_result.modified_count
-        # A miss is not automatically unresolved: another repair may already have
-        # deduplicated the same document. The direct validation pass below is the
-        # authoritative check, so report misses here without guessing their state.
-        missed_trim_count = len(trim_requests) - trim_result.matched_count
-        if missed_trim_count > 0:
-            logger.warning(
-                "[Task %d] %d repeated-CURIE trim(s) did not apply because their "
-                "document changed underneath them; final validation will recheck",
-                task_id,
-                missed_trim_count,
-            )
-
-    if pair_operations:
-        pair_result = collection.bulk_write(pair_operations)
-        correction_count += pair_result.deleted_count + pair_result.modified_count
 
     _validate_nonempty_repair_documents(
         collection, inspected_document_ids, task_id=task_id
