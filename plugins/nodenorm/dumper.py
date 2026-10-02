@@ -3,9 +3,12 @@ import concurrent.futures
 import json
 import math
 import os
+import random
 import shutil
 import sqlite3
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from functools import partial
 from pathlib import Path
 from typing import override, Union
@@ -40,6 +43,10 @@ class _RetryableRangeDownloadError(Exception):
     pass
 
 
+class _RetryableReleaseMarkerError(Exception):
+    pass
+
+
 class NodeNormDumper(LastModifiedHTTPDumper):
     SRC_NAME = "nodenorm"
     SRC_ROOT_FOLDER = Path(config.DATA_ARCHIVE_ROOT) / SRC_NAME
@@ -52,6 +59,9 @@ class NodeNormDumper(LastModifiedHTTPDumper):
     VERSION_URL = VERSION_URL
     SOURCE_ROOT_URL = BABEL_OUTPUT_ROOT
     VERSION_REQUEST_TIMEOUT = 30
+    VERSION_REQUEST_MAX_ATTEMPTS = 4
+    VERSION_REQUEST_BACKOFF_SECONDS = 2
+    VERSION_REQUEST_JITTER_RATIO = 0.25
     ARTIFACT_INDEX_REQUEST_TIMEOUT = 30
 
     LARGE_DOWNLOAD_CHUNK_OVERRIDES = NODENORM_LARGE_DOWNLOAD_CHUNK_OVERRIDES
@@ -569,30 +579,103 @@ class NodeNormDumper(LastModifiedHTTPDumper):
     def get_release(self) -> str:
         """Return the official release named by RENCI's VERSION.txt marker."""
 
-        response = None
-        try:
-            response = self.client.get(
-                self.VERSION_URL,
-                timeout=self.VERSION_REQUEST_TIMEOUT,
-            )
-            if response.status_code >= 400:
+        for attempt in range(1, self.VERSION_REQUEST_MAX_ATTEMPTS + 1):
+            response = None
+            retry_error = None
+            try:
+                response = self.client.get(
+                    self.VERSION_URL,
+                    timeout=self.VERSION_REQUEST_TIMEOUT,
+                )
+                if response.status_code >= 400:
+                    message = (
+                        f"Unable to read NodeNorm release marker '{self.VERSION_URL}' "
+                        f"(status: {response.status_code}, reason: {response.reason})"
+                    )
+                    if response.status_code not in self.RETRYABLE_HTTP_STATUS_CODES:
+                        raise DumperException(message)
+                    retry_error = _RetryableReleaseMarkerError(message)
+                else:
+                    try:
+                        return parse_version_marker(response.text)
+                    except NodeNormReleaseError as exc:
+                        raise DumperException(
+                            f"Invalid NodeNorm release marker '{self.VERSION_URL}': "
+                            f"{exc}"
+                        ) from exc
+            except (
+                requests_exceptions.InvalidURL,
+                requests_exceptions.SSLError,
+            ) as exc:
+                raise DumperException(
+                    f"Unable to read NodeNorm release marker '{self.VERSION_URL}': "
+                    f"{exc}"
+                ) from exc
+            except (
+                requests_exceptions.ChunkedEncodingError,
+                requests_exceptions.ConnectionError,
+                requests_exceptions.ContentDecodingError,
+                requests_exceptions.Timeout,
+            ) as exc:
+                retry_error = exc
+            except requests_exceptions.RequestException as exc:
+                raise DumperException(
+                    f"Unable to read NodeNorm release marker '{self.VERSION_URL}': "
+                    f"{exc}"
+                ) from exc
+            finally:
+                if response is not None:
+                    response.close()
+
+            if attempt == self.VERSION_REQUEST_MAX_ATTEMPTS:
                 raise DumperException(
                     f"Unable to read NodeNorm release marker '{self.VERSION_URL}' "
-                    f"(status: {response.status_code}, reason: {response.reason})"
-                )
+                    f"after {attempt} attempts: {retry_error}"
+                ) from retry_error
+
+            delay = self._release_marker_retry_delay(attempt, response)
+            self.logger.warning(
+                "Retrying NodeNorm release marker '%s' in %.2f seconds after "
+                "attempt %d/%d failed: %s",
+                self.VERSION_URL,
+                delay,
+                attempt,
+                self.VERSION_REQUEST_MAX_ATTEMPTS,
+                retry_error,
+            )
+            time.sleep(delay)
+
+        raise AssertionError("NodeNorm release marker retry loop ended unexpectedly")
+
+    def _release_marker_retry_delay(self, attempt: int, response) -> float:
+        backoff = self.VERSION_REQUEST_BACKOFF_SECONDS * (2 ** (attempt - 1))
+        delay = backoff + random.uniform(0, backoff * self.VERSION_REQUEST_JITTER_RATIO)
+        retry_after = self._retry_after_seconds(response)
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        return delay
+
+    def _retry_after_seconds(self, response) -> float | None:
+        if response is None:
+            return None
+        retry_after = response.headers.get("Retry-After")
+        if not retry_after:
+            return None
+
+        try:
+            delay = float(retry_after)
+        except (TypeError, ValueError):
             try:
-                return parse_version_marker(response.text)
-            except NodeNormReleaseError as exc:
-                raise DumperException(
-                    f"Invalid NodeNorm release marker '{self.VERSION_URL}': {exc}"
-                ) from exc
-        except requests_exceptions.RequestException as exc:
-            raise DumperException(
-                f"Unable to read NodeNorm release marker '{self.VERSION_URL}': {exc}"
-            ) from exc
-        finally:
-            if response is not None:
-                response.close()
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        if not math.isfinite(delay) or delay < 0:
+            return None
+        return delay
 
     def set_release(self) -> None:
         """Set the SDK release value from RENCI's authoritative marker."""

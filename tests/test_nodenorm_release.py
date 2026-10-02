@@ -3,6 +3,8 @@ import importlib.util
 import logging
 import sys
 import types
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 
 import pytest
@@ -28,10 +30,11 @@ CONFLATION_INDEX = index_html(*CONFLATIONS)
 
 
 class FakeResponse:
-    def __init__(self, text="", status_code=200, reason="OK"):
+    def __init__(self, text="", status_code=200, reason="OK", headers=None):
         self.text = text
         self.status_code = status_code
         self.reason = reason
+        self.headers = headers or {}
         self.closed = False
 
     def close(self):
@@ -211,22 +214,175 @@ def test_invalid_version_markers_are_rejected(nodenorm_modules, marker):
         nodenorm_modules.release.parse_version_marker(marker)
 
 
-def test_release_marker_request_errors_are_wrapped(nodenorm_modules, tmp_path):
-    request_error = nodenorm_modules.dumper.requests_exceptions.Timeout("timed out")
+def test_release_marker_nonretryable_request_errors_are_wrapped(
+    nodenorm_modules, tmp_path
+):
+    request_error = nodenorm_modules.dumper.requests_exceptions.InvalidURL(
+        "invalid URL"
+    )
     dumper = make_dumper(nodenorm_modules, tmp_path, request_error)
 
-    with pytest.raises(nodenorm_modules.dumper.DumperException, match="timed out"):
+    with pytest.raises(nodenorm_modules.dumper.DumperException, match="invalid URL"):
         dumper.get_release()
 
+    assert len(dumper.client.get_calls) == 1
 
-def test_release_marker_http_errors_are_wrapped_and_closed(nodenorm_modules, tmp_path):
-    response = FakeResponse(status_code=503, reason="Service Unavailable")
+
+def test_release_marker_certificate_errors_are_not_retried(
+    nodenorm_modules, tmp_path, monkeypatch
+):
+    certificate_error = nodenorm_modules.dumper.requests_exceptions.SSLError(
+        "certificate verification failed"
+    )
+    dumper = make_dumper(nodenorm_modules, tmp_path, FakeResponse())
+    dumper.client = FakeClient([certificate_error, FakeResponse("Babel 2025sep1\n")])
+    sleeps = []
+    monkeypatch.setattr(nodenorm_modules.dumper.time, "sleep", sleeps.append)
+
+    with pytest.raises(
+        nodenorm_modules.dumper.DumperException,
+        match="certificate verification failed",
+    ):
+        dumper.get_release()
+
+    assert len(dumper.client.get_calls) == 1
+    assert sleeps == []
+
+
+def test_release_marker_nonretryable_http_errors_fail_immediately(
+    nodenorm_modules, tmp_path, monkeypatch
+):
+    response = FakeResponse(status_code=404, reason="Not Found")
     dumper = make_dumper(nodenorm_modules, tmp_path, response)
+    sleeps = []
+    monkeypatch.setattr(nodenorm_modules.dumper.time, "sleep", sleeps.append)
 
-    with pytest.raises(nodenorm_modules.dumper.DumperException, match="status: 503"):
+    with pytest.raises(nodenorm_modules.dumper.DumperException, match="status: 404"):
         dumper.get_release()
 
     assert response.closed is True
+    assert len(dumper.client.get_calls) == 1
+    assert sleeps == []
+
+
+def test_release_marker_retries_timeout_then_succeeds(
+    nodenorm_modules, tmp_path, monkeypatch
+):
+    timeout = nodenorm_modules.dumper.requests_exceptions.Timeout("timed out")
+    response = FakeResponse("Babel 2025sep1\n")
+    dumper = make_dumper(nodenorm_modules, tmp_path, response)
+    dumper.client = FakeClient([timeout, response])
+    sleeps = []
+    monkeypatch.setattr(nodenorm_modules.dumper.random, "uniform", lambda *_: 0)
+    monkeypatch.setattr(nodenorm_modules.dumper.time, "sleep", sleeps.append)
+
+    assert dumper.get_release() == "2025sep1"
+
+    assert len(dumper.client.get_calls) == 2
+    assert sleeps == [2]
+    assert response.closed is True
+
+
+def test_release_marker_retries_interrupted_response_then_succeeds(
+    nodenorm_modules, tmp_path, monkeypatch
+):
+    interrupted = nodenorm_modules.dumper.requests_exceptions.ChunkedEncodingError(
+        "incomplete body"
+    )
+    response = FakeResponse("Babel 2025sep1\n")
+    dumper = make_dumper(nodenorm_modules, tmp_path, response)
+    dumper.client = FakeClient([interrupted, response])
+    sleeps = []
+    monkeypatch.setattr(nodenorm_modules.dumper.random, "uniform", lambda *_: 0)
+    monkeypatch.setattr(nodenorm_modules.dumper.time, "sleep", sleeps.append)
+
+    assert dumper.get_release() == "2025sep1"
+
+    assert len(dumper.client.get_calls) == 2
+    assert sleeps == [2]
+    assert response.closed is True
+
+
+def test_release_marker_honors_retry_after_for_retryable_http_error(
+    nodenorm_modules, tmp_path, monkeypatch
+):
+    unavailable = FakeResponse(
+        status_code=503,
+        reason="Service Unavailable",
+        headers={"Retry-After": "300"},
+    )
+    response = FakeResponse("Babel 2025sep1\n")
+    dumper = make_dumper(nodenorm_modules, tmp_path, response)
+    dumper.client = FakeClient([unavailable, response])
+    sleeps = []
+    monkeypatch.setattr(
+        nodenorm_modules.dumper.random, "uniform", lambda _lower, upper: upper
+    )
+    monkeypatch.setattr(nodenorm_modules.dumper.time, "sleep", sleeps.append)
+
+    assert dumper.get_release() == "2025sep1"
+
+    assert sleeps == [300]
+    assert unavailable.closed is True
+    assert response.closed is True
+
+
+def test_release_marker_parses_http_date_retry_after(
+    nodenorm_modules, tmp_path, monkeypatch
+):
+    now = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
+    retry_at = now + timedelta(seconds=90)
+
+    class FrozenDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is timezone.utc
+            return now
+
+    dumper = make_dumper(nodenorm_modules, tmp_path, FakeResponse())
+    response = FakeResponse(
+        headers={"Retry-After": format_datetime(retry_at, usegmt=True)}
+    )
+    monkeypatch.setattr(nodenorm_modules.dumper, "datetime", FrozenDateTime)
+
+    assert dumper._retry_after_seconds(response) == 90
+
+
+def test_release_marker_exhausts_transient_retry_budget(
+    nodenorm_modules, tmp_path, monkeypatch
+):
+    timeouts = [
+        nodenorm_modules.dumper.requests_exceptions.Timeout(f"timeout {attempt}")
+        for attempt in range(1, 5)
+    ]
+    dumper = make_dumper(nodenorm_modules, tmp_path, FakeResponse())
+    dumper.client = FakeClient(timeouts)
+    sleeps = []
+    monkeypatch.setattr(nodenorm_modules.dumper.random, "uniform", lambda *_: 0)
+    monkeypatch.setattr(nodenorm_modules.dumper.time, "sleep", sleeps.append)
+
+    with pytest.raises(
+        nodenorm_modules.dumper.DumperException, match="after 4 attempts.*timeout 4"
+    ):
+        dumper.get_release()
+
+    assert len(dumper.client.get_calls) == 4
+    assert sleeps == [2, 4, 8]
+
+
+def test_invalid_release_marker_is_not_retried(nodenorm_modules, tmp_path, monkeypatch):
+    invalid = FakeResponse("Babel unexpected\n")
+    dumper = make_dumper(nodenorm_modules, tmp_path, invalid)
+    dumper.client = FakeClient([invalid, FakeResponse("Babel 2025sep1\n")])
+    sleeps = []
+    monkeypatch.setattr(nodenorm_modules.dumper.time, "sleep", sleeps.append)
+
+    with pytest.raises(nodenorm_modules.dumper.DumperException, match="Invalid"):
+        dumper.get_release()
+
+    assert len(dumper.client.get_calls) == 1
+    assert sleeps == []
+    assert invalid.closed is True
 
 
 def test_new_release_queues_immutable_urls_in_new_folder(nodenorm_modules, tmp_path):
