@@ -1,8 +1,8 @@
 import concurrent.futures
-import copy
 import hashlib
 import itertools
 import json
+import math
 import multiprocessing
 import os
 import queue
@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import time
 import zlib
-from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
 
@@ -23,16 +23,24 @@ from biothings.utils.serializer import json_loads
 from biothings.utils.hub_db import get_src_db
 from biothings.utils.common import iter_n
 
+from .release import local_compendium_paths
 from .static import (
     CONFLATION_LOOKUP_DATABASE,
     DRUG_CHEMICAL_IDENTIFIER_FILES,
     GENE_PROTEIN_IDENTIFER_FILES,
     IDENTIFIER_LOOKUP_DATABASE,
-    NODENORM_UPLOAD_CHUNKS,
+    NODENORM_UPLOAD_CHUNK_OVERRIDES,
 )
 
 logger = config.logger
 NODENORM_WORKER_COUNT = 30
+NODENORM_CURIE_VALIDATION_MODES = frozenset({"off", "report", "strict"})
+NODENORM_VALIDATION_FAILURE_SAMPLE_SIZE = 20
+NODENORM_VALIDATION_BATCH_SIZE = 100
+NODENORM_VALIDATION_PROGRESS_INTERVAL = 10_000
+NODENORM_VALIDATION_MONGO_ATTEMPTS = 3
+NODENORM_UPLOAD_TARGET_PARTITION_BYTES = 512 * 1024 * 1024
+NODENORM_UPLOAD_MAX_PARTITIONS = 50
 NODENORM_IDENTIFIER_SHARD_COUNT = 8
 NODENORM_IDENTIFIER_BATCH_SIZE = 100_000
 NODENORM_IDENTIFIER_SHARD_QUEUE_SIZE = 60
@@ -40,6 +48,55 @@ NODENORM_IDENTIFIER_COMMIT_BATCHES = 8
 IDENTIFIER_WRITER_STOP = None
 IDENTIFIER_QUEUES = None
 IDENTIFIER_WRITER_FAILED = None
+
+
+class NodeNormCollectionValidationError(RuntimeError):
+    """The uploaded collection does not satisfy NodeNorm's CURIE contract."""
+
+
+@dataclass(frozen=True)
+class CurieValidationReport:
+    """The measured state of duplicate CURIE candidates after cleanup."""
+
+    candidate_count: int
+    missing_count: int
+    multiple_document_count: int
+    repeated_in_document_count: int
+    samples: tuple[str, ...]
+    complete: bool = True
+
+    @property
+    def violation_count(self) -> int:
+        return (
+            self.missing_count
+            + self.multiple_document_count
+            + self.repeated_in_document_count
+        )
+
+    def failure_message(self) -> str:
+        message = (
+            "NodeNorm CURIE uniqueness audit found "
+            f"{self.violation_count} violation(s) among "
+            f"{self.candidate_count} processed candidate CURIE(s); expected exactly one "
+            "occurrence in exactly one document. "
+            f"missing={self.missing_count}, "
+            f"multiple-documents={self.multiple_document_count}, "
+            f"repeated-in-document={self.repeated_in_document_count}. "
+            f"Examples: {'; '.join(self.samples)}"
+        )
+        if not self.complete:
+            message += " Audit incomplete because MongoDB remained unavailable."
+        return message
+
+
+def _curie_validation_mode() -> str:
+    mode = getattr(config, "NODENORM_CURIE_VALIDATION_MODE", "off")
+    if not isinstance(mode, str) or mode not in NODENORM_CURIE_VALIDATION_MODES:
+        choices = ", ".join(sorted(NODENORM_CURIE_VALIDATION_MODES))
+        raise ValueError(
+            "NODENORM_CURIE_VALIDATION_MODE must be one of " f"{choices}; got {mode!r}"
+        )
+    return mode
 
 
 def _configure_sqlite_tmpdir() -> Path:
@@ -57,6 +114,8 @@ def _configure_sqlite_tmpdir() -> Path:
 
 
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
+    validation_mode = _curie_validation_mode()
+    compendium_paths = local_compendium_paths(data_folder)
     _configure_sqlite_tmpdir()
 
     create_identifiers_table(data_folder)
@@ -83,12 +142,13 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
             _identifier_database_paths(data_folder)
         )
     ]
-    identifier_writers_started = False
+    started_identifier_writers = []
+    upload_error = None
 
     try:
         for identifier_writer in identifier_writers:
             identifier_writer.start()
-        identifier_writers_started = True
+            started_identifier_writers.append(identifier_writer)
 
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=NODENORM_WORKER_COUNT,
@@ -97,25 +157,25 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
             initargs=(identifier_queues, identifier_writer_failed),
         ) as executor:
             process_futures = set()
-            for index, task in enumerate(
-                _build_offset_tasks(data_folder, collection_name)
-            ):
-                future = executor.submit(subset_upload_worker, **task)
-                process_futures.add(future)
+            try:
+                for index, task in enumerate(
+                    _build_offset_tasks(
+                        data_folder,
+                        collection_name,
+                        input_files=compendium_paths,
+                    )
+                ):
+                    future = executor.submit(subset_upload_worker, **task)
+                    process_futures.add(future)
 
-            total_document_count = 0
-            for index, future in enumerate(
-                concurrent.futures.as_completed(process_futures)
-            ):
-                # Completed futures retain their result; drop our reference
-                # before waiting on the next upload task.
-                process_futures.discard(future)
-                try:
+                total_document_count = 0
+                for index, future in enumerate(
+                    concurrent.futures.as_completed(process_futures)
+                ):
+                    # Completed futures retain their result; drop our reference
+                    # before waiting on the next upload task.
+                    process_futures.discard(future)
                     identifier_count = future.result()
-                except Exception as gen_exc:
-                    logger.exception(gen_exc)
-                    raise gen_exc
-                else:
                     total_document_count += identifier_count
                     logger.debug(
                         "Task %s completed | Update %s identifiers | Total identifiers %s",
@@ -125,24 +185,67 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
                     )
                     del identifier_count
                     del future
+            except Exception as upload_exception:
+                logger.exception(upload_exception)
+                for pending_future in process_futures:
+                    pending_future.cancel()
+                raise
+    except Exception as upload_exception:
+        upload_error = upload_exception
     finally:
-        if identifier_writers_started and not identifier_writer_failed.is_set():
-            for identifier_queue in identifier_queues:
-                identifier_queue.put(IDENTIFIER_WRITER_STOP)
-        if identifier_writers_started:
-            for identifier_writer in identifier_writers:
-                identifier_writer.join()
+        for identifier_queue in identifier_queues[: len(started_identifier_writers)]:
+            identifier_queue.put(IDENTIFIER_WRITER_STOP)
+        for identifier_writer in started_identifier_writers:
+            identifier_writer.join()
         for identifier_queue in identifier_queues:
             identifier_queue.close()
             identifier_queue.join_thread()
 
     if identifier_writer_errors:
+        if upload_error is not None:
+            raise identifier_writer_errors[0] from upload_error
         raise identifier_writer_errors[0]
+    if upload_error is not None:
+        raise upload_error
 
+    _prepare_collection_for_promotion(
+        data_folder, collection_name, validation_mode=validation_mode
+    )
+    return int(total_document_count)
+
+
+def _prepare_collection_for_promotion(
+    data_folder: Union[str, Path], collection_name: str, validation_mode: str
+) -> None:
+    """Build repair indexes, clean duplicates, and optionally audit the result."""
     create_mongo_identifiers_index(collection_name)
     create_identifiers_index(data_folder)
     cleanup_curie_duplication(data_folder, collection_name)
-    return int(total_document_count)
+    if validation_mode == "off":
+        logger.info(
+            "Skipping the opt-in NodeNorm CURIE uniqueness audit before promotion"
+        )
+        return
+
+    try:
+        validation_report = validate_curie_uniqueness(data_folder, collection_name)
+    except pymongo.errors.ServerSelectionTimeoutError as validation_error:
+        message = "NodeNorm CURIE uniqueness audit could not start: MongoDB unavailable"
+        if validation_mode == "strict":
+            raise NodeNormCollectionValidationError(
+                f"{message}; strict mode blocks collection promotion"
+            ) from validation_error
+        logger.exception("%s; report mode allows collection promotion", message)
+        return
+
+    if validation_report.complete and validation_report.violation_count == 0:
+        return
+    if validation_mode == "strict":
+        raise NodeNormCollectionValidationError(validation_report.failure_message())
+    logger.warning(
+        "%s Promotion remains allowed because validation mode is report.",
+        validation_report.failure_message(),
+    )
 
 
 def _configure_identifier_writer(identifier_queues, identifier_writer_failed):
@@ -152,7 +255,11 @@ def _configure_identifier_writer(identifier_queues, identifier_writer_failed):
     IDENTIFIER_WRITER_FAILED = identifier_writer_failed
 
 
-def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
+def _build_offset_tasks(
+    data_folder: Union[str, Path],
+    collection_name: str,
+    input_files: tuple[Path, ...] | None = None,
+):
     """
     Reads every file and builds an index file compiling the offset ranges
     we want to read as a subset of the file processing.
@@ -195,10 +302,24 @@ def _build_offset_tasks(data_folder: Union[str, Path], collection_name: str):
             argument_collection.append(arguments)
         return argument_collection
 
+    if input_files is None:
+        input_files = local_compendium_paths(data_folder)
     thread_futures = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        for filename, num_partitions in NODENORM_UPLOAD_CHUNKS.items():
-            filepath = Path(data_folder).joinpath(filename).resolve().absolute()
+        for filepath in input_files:
+            filepath = filepath.resolve().absolute()
+            num_partitions = NODENORM_UPLOAD_CHUNK_OVERRIDES.get(filepath.name)
+            if num_partitions is None:
+                num_partitions = max(
+                    1,
+                    min(
+                        NODENORM_UPLOAD_MAX_PARTITIONS,
+                        math.ceil(
+                            filepath.stat().st_size
+                            / NODENORM_UPLOAD_TARGET_PARTITION_BYTES
+                        ),
+                    ),
+                )
             arguments = {"input_file": filepath, "num_partitions": num_partitions}
             future = executor.submit(_populate_upload_arguments, **arguments)
             thread_futures.append(future)
@@ -590,22 +711,23 @@ def _write_identifier_batches(
     Own one SQLite identifier shard connection and persist streamed worker batches.
     """
     identifier_connection = None
+    stop_received = False
 
     try:
         identifier_connection = _connect_identifier_database(identifier_database)
         cursor = identifier_connection.cursor()
 
         while True:
-            if identifier_writer_failed.is_set():
-                break
-
             try:
                 identifier_batch = identifier_queue.get(timeout=5)
             except queue.Empty:
                 continue
 
             if identifier_batch is IDENTIFIER_WRITER_STOP:
+                stop_received = True
                 break
+            if identifier_writer_failed.is_set():
+                continue
 
             update_identifier_collection(cursor, identifier_batch)
             batch_count = 1
@@ -619,6 +741,7 @@ def _write_identifier_batches(
                     break
 
                 if identifier_batch is IDENTIFIER_WRITER_STOP:
+                    stop_received = True
                     break
 
                 update_identifier_collection(cursor, identifier_batch)
@@ -626,18 +749,33 @@ def _write_identifier_batches(
 
             identifier_connection.commit()
 
-            if (
-                identifier_batch is IDENTIFIER_WRITER_STOP
-                or identifier_writer_failed.is_set()
-            ):
+            if stop_received:
                 break
     except Exception as write_exception:
-        identifier_writer_failed.set()
         identifier_writer_errors.append(write_exception)
+        identifier_writer_failed.set()
         logger.exception(write_exception)
+        if not stop_received:
+            _drain_identifier_queue(identifier_queue)
     finally:
         if identifier_connection is not None:
-            identifier_connection.close()
+            try:
+                identifier_connection.close()
+            except Exception as close_exception:
+                identifier_writer_errors.append(close_exception)
+                identifier_writer_failed.set()
+                logger.exception(close_exception)
+
+
+def _drain_identifier_queue(identifier_queue):
+    """Discard queued batches until shutdown so producer feeder threads can exit."""
+    while True:
+        try:
+            identifier_batch = identifier_queue.get(timeout=5)
+        except queue.Empty:
+            continue
+        if identifier_batch is IDENTIFIER_WRITER_STOP:
+            return
 
 
 def update_identifier_collection(cursor: sqlite3.Cursor, identifiers: list[str]):
@@ -655,40 +793,78 @@ def update_identifier_collection(cursor: sqlite3.Cursor, identifiers: list[str])
     cursor.executemany(upsert_statement, identifier_information)
 
 
-def cleanup_curie_duplication(data_folder: Union[str, Path], collection_name: str):
+def cleanup_curie_duplication(
+    data_folder: Union[str, Path], collection_name: str
+) -> tuple[int, int]:
     """
     Handle the CURIE duplication directly in the mongodb database
+
+    Returns the number of operations MongoDB applied and the number of duplicate
+    CURIEs left unresolved.
+
+    A CURIE we cannot reason about is counted rather than raising immediately so
+    the cleanup can evaluate and summarize the full candidate set. When enabled,
+    the direct audit measures what remains and the configured validation mode
+    decides whether it blocks promotion. Actual processing errors propagate.
+
+    Neither count establishes that `identifiers.i` is unique afterwards, which is
+    the 1-1 mapping the Elasticsearch terms query depends on (see README,
+    "Post Upload Processing"):
+
+    - corrections are documents deleted plus documents modified, so they are not
+      a count of distinct documents, and repairing several CURIEs on one document
+      can report fewer corrections than CURIEs resolved;
+    - a pull the server declines in order to keep a document non-empty applies
+      nothing and is indistinguishable here from one that had already been
+      applied, so it is not counted unresolved even though the CURIE still is.
+
+    Validating the collection against the shard CURIE set before the uploader
+    promotes it is what settles uniqueness. These counters are for reporting.
     """
     logger.info("Handling CURIE duplication issue")
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=NODENORM_WORKER_COUNT
-    ) as executor:
-        process_futures = []
+    total_correction_count = 0
+    total_unresolved_count = 0
+
+    # Pair repairs can change documents that a later CURIE depends on. Keep this
+    # loop serial, and have the handler apply each candidate before reading the
+    # next one. The 1,000-CURIE chunks only amortize connection and progress
+    # bookkeeping; they are not planned from one shared database snapshot. Do not
+    # parallelize this loop without re-reading and writing while all documents
+    # involved in a repair are locked together.
+    try:
         duplicate_curies = _iter_duplicate_curies(data_folder)
         for index, curie_batch in enumerate(iter_n(duplicate_curies, 1000)):
-            arguments = {
-                "task_id": index,
-                "curies": curie_batch,
-                "collection_name": collection_name,
-            }
-            future = executor.submit(_curie_duplication_batch_handler, **arguments)
-            process_futures.append(future)
+            task_id, num_corrections, num_unresolved = _curie_duplication_batch_handler(
+                task_id=index,
+                curies=curie_batch,
+                collection_name=collection_name,
+            )
+            total_correction_count += num_corrections
+            total_unresolved_count += num_unresolved
+            logger.debug(
+                "Task %s completed | Applied %s operation(s) | Total corrections %s",
+                task_id,
+                num_corrections,
+                total_correction_count,
+            )
+    except Exception:
+        logger.exception("CURIE duplicate cleanup failed")
+        raise
 
-        total_correction_count = 0
-        for future in concurrent.futures.as_completed(process_futures):
-            try:
-                task_id, num_corrections = future.result()
-            except Exception as gen_exc:
-                logger.exception(gen_exc)
-            else:
-                total_correction_count += num_corrections
-                logger.debug(
-                    "Task %s completed | Corrected %s documents | Total corrections %s",
-                    task_id,
-                    num_corrections,
-                    total_correction_count,
-                )
+    logger.info(
+        "CURIE duplicate cleanup applied %s operation(s) and left %s duplicate "
+        "CURIE(s) unresolved; this is not a uniqueness check",
+        total_correction_count,
+        total_unresolved_count,
+    )
+    if total_unresolved_count > 0:
+        logger.warning(
+            "%s duplicate CURIE(s) were left as-is; grep the log for "
+            "'Unable to resolve duplicate CURIE' for the individual CURIEs",
+            total_unresolved_count,
+        )
+    return total_correction_count, total_unresolved_count
 
 
 def _iter_duplicate_curies(data_folder: Union[str, Path]):
@@ -705,9 +881,453 @@ def _iter_duplicate_curies(data_folder: Union[str, Path]):
             identifier_connection.close()
 
 
-def _curie_duplication_batch_handler(
-    task_id: int, curies: list[str], collection_name: str
+def validate_curie_uniqueness(
+    data_folder: Union[str, Path],
+    collection_name: str,
+) -> CurieValidationReport:
+    """
+    Measure whether every CURIE counted more than once now occurs exactly once.
+
+    The SQLite shards are the complete candidate set: a CURIE cannot occur more
+    than once in MongoDB unless the upload encountered it more than once. Each
+    lookup uses the existing ``identifiers.i`` index and is capped at two
+    documents. Inspecting the projected identifier arrays also catches a CURIE
+    repeated within one document, which a document-count check alone would miss.
+
+    CURIE equality here is the same raw, case-sensitive equality used by the
+    uploader and MongoDB cleanup. This audit does not attempt to reproduce the
+    external Elasticsearch normalizer.
+
+    This indexed candidate check intentionally avoids a collection-wide empty-
+    array scan. Source ingestion already requires ``identifiers[0]``, and every
+    cleanup mutation either deletes the document, deduplicates to at least one
+    identifier, or guards its pull on leaving an identifier behind.
+
+    This function only measures and returns the result. The caller applies the
+    configured report-or-strict promotion policy.
+    """
+    logger.info("Validating duplicate CURIE repairs before collection promotion")
+    upload_database = get_src_db()
+    collection = pymongo.collection.Collection(
+        database=upload_database, name=collection_name
+    )
+
+    candidate_count = 0
+    failure_counts = {"missing": 0, "multiple": 0, "repeated": 0}
+    failure_samples = []
+    next_progress = NODENORM_VALIDATION_PROGRESS_INTERVAL
+    curie_batches = iter_n(
+        _iter_duplicate_curies(data_folder), NODENORM_VALIDATION_BATCH_SIZE
+    )
+    validation_stop = threading.Event()
+    audit_complete = True
+
+    # Validation is read-only and can safely recover most of the indexed lookup
+    # throughput that state-dependent cleanup deliberately gives up. Keep only a
+    # bounded number of batches in flight so a very large candidate set does not
+    # become another unbounded Future list.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=NODENORM_WORKER_COUNT
+    ) as executor:
+        pending_futures = set()
+        try:
+            for _index in range(NODENORM_WORKER_COUNT * 2):
+                if validation_stop.is_set():
+                    break
+                try:
+                    curie_batch = next(curie_batches)
+                except StopIteration:
+                    break
+                pending_futures.add(
+                    executor.submit(
+                        _validate_curie_batch,
+                        collection,
+                        curie_batch,
+                        validation_stop,
+                    )
+                )
+
+            while pending_futures:
+                completed_futures, pending_futures = concurrent.futures.wait(
+                    pending_futures,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in completed_futures:
+                    batch_count, batch_failures, batch_samples = future.result()
+                    candidate_count += batch_count
+                    for failure_kind, count in batch_failures.items():
+                        failure_counts[failure_kind] += count
+                    remaining_sample_slots = (
+                        NODENORM_VALIDATION_FAILURE_SAMPLE_SIZE - len(failure_samples)
+                    )
+                    if remaining_sample_slots > 0:
+                        failure_samples.extend(batch_samples[:remaining_sample_slots])
+
+                    if not validation_stop.is_set():
+                        try:
+                            curie_batch = next(curie_batches)
+                        except StopIteration:
+                            pass
+                        else:
+                            pending_futures.add(
+                                executor.submit(
+                                    _validate_curie_batch,
+                                    collection,
+                                    curie_batch,
+                                    validation_stop,
+                                )
+                            )
+
+                if candidate_count >= next_progress:
+                    logger.info(
+                        "Validated %s duplicate CURIE candidate(s) so far",
+                        candidate_count,
+                    )
+                    while candidate_count >= next_progress:
+                        next_progress += NODENORM_VALIDATION_PROGRESS_INTERVAL
+        except pymongo.errors.ServerSelectionTimeoutError:
+            validation_stop.set()
+            for pending_future in pending_futures:
+                pending_future.cancel()
+            audit_complete = False
+            logger.warning(
+                "MongoDB remained unavailable; returning a partial CURIE audit "
+                "after %s processed candidate(s): missing=%s, "
+                "multiple-documents=%s, repeated-in-document=%s",
+                candidate_count,
+                failure_counts["missing"],
+                failure_counts["multiple"],
+                failure_counts["repeated"],
+            )
+        except Exception:
+            # Setting the event lets already-running batches stop after their
+            # current Mongo query; cancel() keeps queued batches from starting.
+            # Without both, ThreadPoolExecutor's context manager waits for up to
+            # twice the worker count of unnecessary batches before propagating a
+            # server failure.
+            validation_stop.set()
+            for pending_future in pending_futures:
+                pending_future.cancel()
+            raise
+
+    validation_report = CurieValidationReport(
+        candidate_count=candidate_count,
+        missing_count=failure_counts["missing"],
+        multiple_document_count=failure_counts["multiple"],
+        repeated_in_document_count=failure_counts["repeated"],
+        samples=tuple(failure_samples),
+        complete=audit_complete,
+    )
+    logger.info(
+        "NodeNorm CURIE uniqueness audit %s after %s processed candidate CURIE(s) "
+        "with %s violation(s)",
+        "completed" if audit_complete else "stopped early",
+        candidate_count,
+        validation_report.violation_count,
+    )
+    return validation_report
+
+
+def _validate_curie_batch(
+    collection, curie_rows, validation_stop=None
+) -> tuple[int, dict, list[str]]:
+    """Validate one bounded, read-only batch and return aggregate diagnostics."""
+    failure_counts = {"missing": 0, "multiple": 0, "repeated": 0}
+    failure_samples = []
+    projection = {"_id": 1, "identifiers.i": 1}
+    processed_count = 0
+
+    for result in curie_rows:
+        if validation_stop is not None and validation_stop.is_set():
+            break
+        duplicate_curie = result[0]
+        try:
+            documents = _find_curie_documents_with_retry(
+                collection, duplicate_curie, projection
+            )
+        except Exception:
+            if validation_stop is not None:
+                validation_stop.set()
+            raise
+        processed_count += 1
+        occurrence_count = sum(
+            identifier.get("i") == duplicate_curie
+            for document in documents
+            for identifier in document.get("identifiers", [])
+        )
+
+        if len(documents) == 0:
+            failure_kind = "missing"
+        elif len(documents) > 1:
+            failure_kind = "multiple"
+        elif occurrence_count != 1:
+            failure_kind = "repeated"
+        else:
+            continue
+
+        failure_counts[failure_kind] += 1
+        if len(failure_samples) < NODENORM_VALIDATION_FAILURE_SAMPLE_SIZE:
+            document_count = (
+                "at least 2" if len(documents) == 2 else str(len(documents))
+            )
+            failure_samples.append(
+                f"{duplicate_curie!r} (documents={document_count}, "
+                f"occurrences in returned documents={occurrence_count})"
+            )
+
+    return processed_count, failure_counts, failure_samples
+
+
+def _find_curie_documents_with_retry(collection, duplicate_curie, projection):
+    """Retry only the transient MongoDB failure expected during Hub contention."""
+    for attempt in range(1, NODENORM_VALIDATION_MONGO_ATTEMPTS + 1):
+        try:
+            return list(
+                collection.find({"identifiers.i": duplicate_curie}, projection).limit(2)
+            )
+        except pymongo.errors.ServerSelectionTimeoutError:
+            if attempt >= NODENORM_VALIDATION_MONGO_ATTEMPTS:
+                raise
+            logger.warning(
+                "MongoDB unavailable while auditing CURIE %s; retrying (%s/%s)",
+                duplicate_curie,
+                attempt,
+                NODENORM_VALIDATION_MONGO_ATTEMPTS,
+            )
+
+    raise AssertionError("MongoDB validation retry loop ended unexpectedly")
+
+
+def _identifier_curies(document: dict) -> list[str]:
+    """
+    The CURIEs of a document's identifiers, in order, repeats included.
+
+    Comparisons must be made on the CURIE. Comparing whole identifier
+    dictionaries makes a CURIE shared with a different label or description look
+    like two unrelated identifiers, which is precisely the duplication this
+    cleanup exists to remove.
+    """
+    return [identifier["i"] for identifier in document["identifiers"]]
+
+
+def _document_has_type(document: dict, node_type: str) -> bool:
+    """Support both source strings and type lists produced by duplicate merges."""
+    document_types = document["type"]
+    if isinstance(document_types, (list, tuple, set)):
+        return node_type in document_types
+    return document_types == node_type
+
+
+def _deduplicate_document_identifiers(
+    task_id: int, document: dict
+) -> tuple[Union[object, None], bool]:
+    """
+    Trim repeated CURIEs from a single document, keeping the first occurrence.
+
+    Returns the operation to apply, or None, plus whether the CURIE was left
+    unresolved. Finding nothing to trim is a resolution, not a failure: the
+    shard counters record how often a CURIE was seen during upload, so a CURIE
+    counted twice can legitimately end up in one document once the duplicate
+    `_id` documents were merged.
+
+    The filter pins the identifier array this decision was made from, so a
+    document another worker has since changed is left alone instead of being
+    clobbered. A miss applies nothing and is visible in the batch's applied
+    count.
+    """
+    identifiers = document["identifiers"]
+    seen_curies = set()
+    deduplicated = []
+    for identifier in identifiers:
+        if identifier["i"] in seen_curies:
+            continue
+        seen_curies.add(identifier["i"])
+        deduplicated.append(identifier)
+
+    if len(deduplicated) == len(identifiers):
+        logger.debug(
+            "[Task %d] Document %s holds no repeated CURIE; nothing to trim",
+            task_id,
+            document["_id"],
+        )
+        return None, False
+
+    logger.debug(
+        "[Task %d] Trim %d repeated identifier(s) from document %s",
+        task_id,
+        len(identifiers) - len(deduplicated),
+        document["_id"],
+    )
+    return (
+        pymongo.UpdateOne(
+            {"_id": document["_id"], "identifiers": identifiers},
+            {"$set": {"identifiers": deduplicated}},
+        ),
+        False,
+    )
+
+
+def _evaluate_document_subset(
+    task_id: int, more_identifiers_doc: dict, less_identifiers_doc: dict
 ):
+    """
+    If every CURIE of one document is also in the other we can drop it and keep
+    the other, which covers the whole document. Anything short of that needs the
+    intersection analysis below.
+    """
+    if not set(_identifier_curies(less_identifiers_doc)) <= set(
+        _identifier_curies(more_identifiers_doc)
+    ):
+        return None
+
+    logger.debug(
+        "[Task %d] Delete document %s, a CURIE subset of %s",
+        task_id,
+        less_identifiers_doc["_id"],
+        more_identifiers_doc["_id"],
+    )
+    return pymongo.DeleteOne({"_id": less_identifiers_doc["_id"]})
+
+
+def _evaluate_document_intersection(
+    task_id: int, more_identifiers_doc: dict, less_identifiers_doc: dict
+):
+    """
+    One crucial assumption here is that at least one of these documents has a
+    type of biolink:Protein.
+
+    If the type biolink:Protein isn't found then we cannot make any assumptions
+    about how to handle the intersection between the two documents.
+
+    The colliding CURIEs are pulled from the non-Protein document by CURIE rather
+    than by rewriting its identifier array, so concurrent repairs of other CURIEs
+    on the same document compose instead of overwriting one another, and pulling
+    the same CURIE twice is harmless.
+    """
+    more_is_protein = _document_has_type(more_identifiers_doc, "biolink:Protein")
+    less_is_protein = _document_has_type(less_identifiers_doc, "biolink:Protein")
+    if not more_is_protein and not less_is_protein:
+        return None
+
+    if more_is_protein:
+        main_document = more_identifiers_doc
+        side_document = less_identifiers_doc
+    else:
+        main_document = less_identifiers_doc
+        side_document = more_identifiers_doc
+
+    main_curies = set(_identifier_curies(main_document))
+    side_curies = _identifier_curies(side_document)
+    colliding_curies = sorted({curie for curie in side_curies if curie in main_curies})
+    remaining_curies = [curie for curie in side_curies if curie not in main_curies]
+
+    # Removing every identifier would leave a document that identifies nothing,
+    # so leave the pair for a strategy that can account for it
+    if not colliding_curies or not remaining_curies:
+        return None
+
+    logger.debug(
+        "[Task %d] Pull %d colliding CURIE(s) from document %s, keeping them on "
+        "the biolink:Protein document %s",
+        task_id,
+        len(colliding_curies),
+        side_document["_id"],
+        main_document["_id"],
+    )
+    return pymongo.UpdateOne(
+        {
+            "_id": side_document["_id"],
+            # The check above only proves this pull spares an identifier in the
+            # snapshot it was planned from. A document sharing one CURIE with a
+            # Protein clique can share another with a different one, and those
+            # pulls compose: each spares something on its own and together they
+            # empty the document. Restate the requirement as part of the filter so
+            # the server evaluates it against the document as it stands at write
+            # time, whichever batch or worker gets there first.
+            "identifiers": {"$elemMatch": {"i": {"$nin": colliding_curies}}},
+        },
+        {"$pull": {"identifiers": {"i": {"$in": colliding_curies}}}},
+    )
+
+
+def _resolve_document_pair(
+    task_id: int, documents: list[dict], duplicate_curie: str
+) -> tuple[Union[object, None], bool, list[dict]]:
+    # Compare semantic CURIE-set size rather than raw array length: repeats do not
+    # make a document a superset. For equal sets, prefer an already-deduplicated
+    # survivor, then use _id only as the deterministic final tiebreak.
+    more_identifiers_doc, less_identifiers_doc = sorted(
+        documents,
+        key=lambda document: (
+            -len(set(_identifier_curies(document))),
+            len(document["identifiers"]),
+            str(document["_id"]),
+        ),
+    )
+
+    more_is_protein = _document_has_type(more_identifiers_doc, "biolink:Protein")
+    less_is_protein = _document_has_type(less_identifiers_doc, "biolink:Protein")
+
+    if more_is_protein != less_is_protein:
+        protein_document = (
+            more_identifiers_doc if more_is_protein else less_identifiers_doc
+        )
+        non_protein_document = (
+            less_identifiers_doc if more_is_protein else more_identifiers_doc
+        )
+        # Protein owns every shared CURIE. Delete the non-Protein document only
+        # when Protein covers its complete CURIE set; otherwise keep both and pull
+        # the intersection from the non-Protein side. Running the generic subset
+        # rule first could instead delete a smaller Protein clique.
+        operation = _evaluate_document_subset(
+            task_id, protein_document, non_protein_document
+        )
+        if operation is not None:
+            return operation, False, [protein_document]
+
+        operation = _evaluate_document_intersection(
+            task_id, more_identifiers_doc, less_identifiers_doc
+        )
+        if operation is not None:
+            return operation, False, [more_identifiers_doc, less_identifiers_doc]
+    else:
+        operation = _evaluate_document_subset(
+            task_id, more_identifiers_doc, less_identifiers_doc
+        )
+        if operation is not None:
+            return operation, False, [more_identifiers_doc]
+
+        operation = _evaluate_document_intersection(
+            task_id, more_identifiers_doc, less_identifiers_doc
+        )
+        if operation is not None:
+            return operation, False, [more_identifiers_doc, less_identifiers_doc]
+
+    logger.critical(
+        "[Task %d] Unable to resolve duplicate CURIE %s: neither the subset "
+        "nor the intersection of the 2 documents sharing it can be evaluated",
+        task_id,
+        duplicate_curie,
+    )
+    return None, True, [more_identifiers_doc, less_identifiers_doc]
+
+
+def _curie_duplication_batch_handler(
+    task_id: int, curies: list[tuple[str, ...]], collection_name: str
+) -> tuple[int, int, int]:
+    """
+    `curies` holds the sqlite rows streamed by `_iter_duplicate_curies`, so each
+    entry is a row tuple whose first column is the CURIE.
+
+    Each candidate is read, planned, and applied before the next candidate is
+    read. Although callers provide 1,000-CURIE chunks, dependent repairs must see
+    the changes made earlier in the same chunk.
+
+    Returns the number of operations MongoDB reports as applied and the number of
+    CURIEs no strategy could resolve. The corrections figure comes from the write
+    results rather than the number of candidates, because an earlier repair can
+    also satisfy a later candidate.
+    """
 
     num_retry = 10
     counter = 0
@@ -736,176 +1356,144 @@ def _curie_duplication_batch_handler(
                 num_retry - counter,
             )
 
-    buffer = []
+    inspected_document_ids = set()
+    unresolved_count = 0
+    request_count = 0
+    correction_count = 0
     for result in curies:
-        identifier = result[0]
+        # Apply this candidate before reading the next one. A repair can remove a
+        # CURIE or delete a document that another candidate in this chunk shares.
+        # Planning every request first would make that later decision from a stale
+        # snapshot and can leave a duplicate behind.
+        trim_operations = {}
+        pair_operations = []
 
-        cursor = collection.find({"identifiers.i": identifier})
-        documents = list(cursor)
+        # Named distinctly from the identifier documents inspected below, which
+        # otherwise shadow it
+        duplicate_curie = result[0]
+
+        documents = list(collection.find({"identifiers.i": duplicate_curie}))
+        inspected_document_ids.update(document["_id"] for document in documents)
 
         # Handle case where the identifier.i is duplicated within the same document
         if len(documents) == 1:
-
-            # We need to generate every comparison within the same document. itertools.combinations
-            # produces every combination, but we need to store it on a per identifier level so we
-            # can determine if any of the identifiers match any of the others. This is the goal
-            # behind the comparison matrix we build to make every inner comparison possible
-            identifier_combinations = tuple(
-                itertools.combinations(documents[0]["identifiers"], 2)
+            operation, unresolved = _deduplicate_document_identifiers(
+                task_id, documents[0]
             )
-
-            comparison_matrix = defaultdict(list)
-            for index, identifier in enumerate(documents[0]["identifiers"]):
-                comparison_filter = [
-                    identifier in entry for entry in identifier_combinations
-                ]
-                comparison_matrix[index] = tuple(
-                    itertools.compress(identifier_combinations, comparison_filter)
-                )
-
-            removal_index = []
-            for index, comparisons in comparison_matrix.items():
-                removal_index.append(
-                    not all(
-                        identifier_group[0] == identifier_group[1]
-                        for identifier_group in comparisons
-                    )
-                )
-
-            # Skipping document as we likely already merged this earlier with duplicate _id merging
-            if all(removal_index) or (
-                not any(removal_index) and len(removal_index) == 1
-            ):
-                logger.debug(
-                    "[Task %d] Ignore 1 document due to initial upload BulkWriteError caught duplicate _id. Likely identical documents merged on the type field: %s",
-                    task_id,
-                    documents[0],
-                )
-            elif not any(removal_index) and len(removal_index) > 1:
-                original_document = copy.deepcopy(documents[0])
-                documents[0]["identifiers"] = [documents[0]["identifiers"][0]]
-
-                buffer.append(pymongo.ReplaceOne(original_document, documents[0]))
-                logger.debug(
-                    "[Task %d] Replace 1 document to trim all identifiers except the first due to them all being identical: %s",
-                    task_id,
-                    documents[0],
-                )
-            else:
-                original_document = copy.deepcopy(documents[0])
-                documents[0]["identifiers"] = list(
-                    itertools.compress(documents[0]["identifiers"], removal_index)
-                )
-                buffer.append(pymongo.ReplaceOne(original_document, documents[0]))
-                logger.debug(
-                    "[Task %d] Replace 1 document to trim some duplicate identifiers: %s",
-                    task_id,
-                    documents[0],
-                )
-
+            if not unresolved and operation is not None:
+                # One trim deduplicates every CURIE in the document. Coalescing by
+                # _id avoids duplicate trims if this candidate reaches the same
+                # surviving document through more than one path.
+                trim_operations.setdefault(documents[0]["_id"], operation)
+            operation = None
         # Handle case where the identifier.i is spread across 2 documents
         elif len(documents) == 2:
-
-            def _evaluate_document_subset(
-                more_identifiers_doc: dict, less_identifiers_doc: dict
-            ) -> pymongo.DeleteOne:
-                """
-                If it passes the subset check, then we can safely delete the document while keeping
-                the other document. It must be a complete subset, otherwise we have to perform
-                additional analysis to determine where the interesection exists between the two
-                documents
-                """
-                subset_check = []
-                for subset_identifier in less_identifiers_doc["identifiers"]:
-                    subset_check.append(
-                        subset_identifier in more_identifiers_doc["identifiers"]
-                    )
-
-                operation = None
-                if all(subset_check):
-                    operation = pymongo.DeleteOne(less_identifiers_doc)
-                    logger.debug(
-                        "[Task %d] Delete 1 document: %s", task_id, less_identifiers_doc
-                    )
-                return operation
-
-            def _evaluate_document_intersection(
-                more_identifiers_doc: dict, less_identifiers_doc: dict
-            ):
-                """
-                One crucial assumption here is that at least one of these documents is has a type of
-                biolink:Protein.
-
-                If the type biolink:Protein isn't found then we cannot make any assumptions about
-                how to handle the intersection between the two documents
-                """
-                operation = None
-                if (
-                    more_identifiers_doc["type"] == "biolink:Protein"
-                    or less_identifiers_doc["type"] == "biolink:Protein"
-                ):
-                    if more_identifiers_doc["type"] == "biolink:Protein":
-                        main_document = more_identifiers_doc
-                        side_document = less_identifiers_doc
-                    else:
-                        main_document = less_identifiers_doc
-                        side_document = more_identifiers_doc
-
-                    subset_mask = []
-                    for subset_identifier in side_document["identifiers"]:
-                        subset_mask.append(
-                            subset_identifier not in main_document["identifiers"]
-                        )
-
-                    if any(subset_mask):
-                        original_document = copy.deepcopy(side_document)
-                        side_document["identifiers"] = list(
-                            itertools.compress(
-                                side_document["identifiers"], subset_mask
-                            )
-                        )
-                        operation = pymongo.ReplaceOne(original_document, side_document)
-                        logger.debug(
-                            "[Task %d] Replace 1 document to trim the intersection of identifiers with another document: %s",
-                            task_id,
-                            side_document,
-                        )
-                return operation
-
-            operation = None
-            more_identifiers_doc = None
-            less_identifiers_doc = None
-            if len(documents[0]["identifiers"]) > len(documents[1]["identifiers"]):
-                more_identifiers_doc = documents[0]
-                less_identifiers_doc = documents[1]
-            else:
-                more_identifiers_doc = documents[1]
-                less_identifiers_doc = documents[0]
-
-            operation = _evaluate_document_subset(
-                more_identifiers_doc, less_identifiers_doc
+            operation, unresolved, surviving_documents = _resolve_document_pair(
+                task_id, documents, duplicate_curie
             )
-            if operation is None:
-                operation = _evaluate_document_intersection(
-                    more_identifiers_doc, less_identifiers_doc
+            for surviving_document in surviving_documents:
+                trim_operation, _trim_unresolved = _deduplicate_document_identifiers(
+                    task_id, surviving_document
                 )
+                if trim_operation is not None:
+                    trim_operations.setdefault(
+                        surviving_document["_id"], trim_operation
+                    )
+        # A CURIE the identifier shards counted more than once should be found in
+        # 1 or 2 documents. Anything else is outside what the branches above can
+        # reason about, so leave the documents as they are and report it.
+        else:
+            operation, unresolved = None, True
+            logger.critical(
+                "[Task %d] Unable to resolve duplicate CURIE %s: found in %d "
+                "document(s), expected 1 or 2",
+                task_id,
+                duplicate_curie,
+                len(documents),
+            )
 
-            if operation is None:
-                logger.critical(
-                    "[Task %d] Unable to evaluate identifer %s subset or intersection between documents",
-                    task_id,
-                    identifier,
-                )
-            buffer.append(operation)
+        if unresolved:
+            unresolved_count += 1
+        elif operation is not None:
+            pair_operations.append(operation)
 
-    if buffer is not None and len(buffer) > 0:
+        # Trims stay apart from the pair repair so their matched count remains
+        # useful, and they run first because the pair operation was planned from
+        # the identifiers read above. Final validation, rather than a CAS miss
+        # alone, determines whether any repeat survived.
+        trim_requests = list(trim_operations.values())
+        candidate_request_count = len(trim_requests) + len(pair_operations)
+        request_count += candidate_request_count
+        if candidate_request_count == 0:
+            continue
+
         logger.debug(
-            "[Task %d] Bulk writing %s changes to collection", task_id, len(buffer)
+            "[Task %d] Writing %s change(s) for duplicate CURIE %s",
+            task_id,
+            candidate_request_count,
+            duplicate_curie,
         )
-        collection.bulk_write(buffer)
-        return task_id, len(buffer)
-    else:
+
+        if trim_requests:
+            trim_result = collection.bulk_write(trim_requests)
+            correction_count += trim_result.modified_count
+            # A miss is not automatically unresolved: another repair may already
+            # have deduplicated the same document. The direct validation pass below
+            # is authoritative, so report misses here without guessing their state.
+            missed_trim_count = len(trim_requests) - trim_result.matched_count
+            if missed_trim_count > 0:
+                logger.warning(
+                    "[Task %d] %d repeated-CURIE trim(s) did not apply because "
+                    "their document changed underneath them; final validation "
+                    "will recheck",
+                    task_id,
+                    missed_trim_count,
+                )
+
+        if pair_operations:
+            pair_result = collection.bulk_write(pair_operations)
+            correction_count += pair_result.deleted_count + pair_result.modified_count
+
+    if request_count == 0:
         logger.debug(
             "[Task %d] Bulk writing found no changes to collection to apply", task_id
         )
-        return task_id, 0
+        return task_id, 0, unresolved_count
+
+    _validate_nonempty_repair_documents(
+        collection, inspected_document_ids, task_id=task_id
+    )
+
+    # Correction counts are operations MongoDB applied, so they do not establish
+    # that identifiers.i is unique afterwards: a pull the server declined in order
+    # to keep a document non-empty also applies nothing. Validating the collection
+    # is what settles that.
+    if correction_count < request_count:
+        logger.debug(
+            "[Task %d] %d of %d write request(s) applied; the rest were already "
+            "satisfied or were declined by their filter",
+            task_id,
+            correction_count,
+            request_count,
+        )
+    return task_id, correction_count, unresolved_count
+
+
+def _validate_nonempty_repair_documents(
+    collection, document_ids: set, task_id: int
+) -> None:
+    """Verify every surviving document inspected by a repair still identifies something."""
+    if not document_ids:
+        return
+
+    projection = {"_id": 1}
+    empty_documents = collection.find(
+        {"_id": {"$in": list(document_ids)}, "identifiers": []}, projection
+    )
+    empty_document_ids = [document["_id"] for document in empty_documents]
+    if empty_document_ids:
+        raise NodeNormCollectionValidationError(
+            f"[Task {task_id}] Duplicate repair left {len(empty_document_ids)} "
+            "document(s) with no identifiers; examples: "
+            f"{empty_document_ids[:NODENORM_VALIDATION_FAILURE_SAMPLE_SIZE]!r}"
+        )

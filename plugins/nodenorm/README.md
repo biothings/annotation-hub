@@ -1,35 +1,17 @@
 ## pending-nodenorm
 
-Hosted API of the nodenorm data provided by [RENCI](https://stars.renci.org/var/babel_outputs/2025mar31/compendia/)
+Hosted API of the NodeNorm data provided by
+[RENCI](https://stars.renci.org/var/babel_outputs/). The production dump follows
+the release named by `latest/VERSION.txt`.
 
-File list (with smaller chunk files removed) as of September 2nd 2025
-
-```
-AnatomicalEntity.txt                               02-Sep-2025 03:54            38586258
-BiologicalProcess.txt                              02-Sep-2025 03:54            17470772
-Cell.txt                                           02-Sep-2025 03:54             3524366
-CellLine.txt                                       02-Sep-2025 03:54             6496531
-CellularComponent.txt                              02-Sep-2025 03:54             3190094
-ChemicalEntity.txt                                 02-Sep-2025 03:54           511093905
-ChemicalMixture.txt                                02-Sep-2025 03:54              153385
-ComplexMolecularMixture.txt                        02-Sep-2025 03:54               41199
-Disease.txt                                        02-Sep-2025 03:54           109100284
-Drug.txt                                           02-Sep-2025 03:54            57010182
-Gene.txt                                           02-Sep-2025 03:55         15601671131
-GeneFamily.txt                                     02-Sep-2025 03:55             6255568
-GrossAnatomicalStructure.txt                       02-Sep-2025 03:54             4166218
-MacromolecularComplex.txt                          02-Sep-2025 03:55              129887
-MolecularActivity.txt                              02-Sep-2025 03:55            59513602
-MolecularMixture.txt                               02-Sep-2025 03:56          5959903492
-OrganismTaxon.txt                                  02-Sep-2025 03:56           697224103
-Pathway.txt                                        02-Sep-2025 03:56            14356578
-PhenotypicFeature.txt                              02-Sep-2025 03:56            99273513
-Polypeptide.txt                                    02-Sep-2025 03:56               30486
-Protein.txt                                        02-Sep-2025 03:59         78029682489
-Publication.txt                                    02-Sep-2025 04:01         15169616284
-SmallMolecule.txt                                  02-Sep-2025 04:03         44485987213
-umls.txt                                           02-Sep-2025 04:03           216944636
-```
+For that immutable dated release, the dumper discovers every direct `.txt`
+artifact in `compendia/` and records the exact inventory in a local
+`release-manifest.json`. Split transfer copies such as `Protein.txt.00` are not
+separate compendia. The uploader reads the retained manifest instead of a
+source-code file list, so new Babel compendia are included without loader
+changes. Named download and upload chunk maps are performance overrides only;
+they do not decide which compendia are included. Missing, empty, or malformed
+manifest artifacts block upload.
 
 
 ### Mapping
@@ -334,6 +316,18 @@ The uploader then streams duplicate CURIEs from every shard. It also creates a r
 on `identifiers.i`, which speeds up the document reads needed during duplicate correction. Storage
 and throughput figures from the former single-database implementation do not describe the sharded
 layout and should be remeasured during a full upload.
+
+Duplicate cleanup is intentionally serial. CURIEs are streamed in 1,000-item chunks for connection
+reuse and progress reporting, but each candidate is applied before the next is read so dependent
+repairs do not make decisions from stale snapshots. After cleanup, a bounded parallel validation
+pass checks every duplicate candidate through the MongoDB `identifiers.i` index and reports missing,
+cross-document, and within-document duplicates. This potentially expensive audit is disabled by
+default. Set
+`NODENORM_CURIE_VALIDATION_MODE = "report"` in the Hub configuration to run it without blocking
+promotion on its findings, or set it to `"strict"` to make violations and an incomplete audit block
+promotion. Leaving the setting unset, or explicitly setting it to `"off"`, skips the audit.
+Report mode does not suppress repair-integrity failures: write errors and surviving documents with
+no identifiers always block the upload.
 
 This leads to the different ways we have to resolve the duplicate CURIES:
 

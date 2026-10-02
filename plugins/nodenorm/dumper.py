@@ -3,25 +3,37 @@ import concurrent.futures
 import json
 import math
 import os
+import random
 import shutil
 import sqlite3
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from functools import partial
 from pathlib import Path
 from typing import override, Union
-from urllib.parse import urlparse
 
 from biothings import config
 from biothings.hub.dataload.dumper import DumperException, LastModifiedHTTPDumper
 from biothings.utils.manager import JobManager
 from requests import exceptions as requests_exceptions
 
+from .release import (
+    NodeNormReleaseError,
+    artifact_filenames_from_index,
+    local_compendium_paths,
+    make_release_manifest,
+    parse_version_marker,
+    read_release_manifest,
+    validate_release,
+    write_release_manifest,
+)
 from .static import (
-    BASE_URL,
+    BABEL_OUTPUT_ROOT,
     CONFLATION_LOOKUP_DATABASE,
-    NODENORM_BIG_FILE_COLLECTION,
     NODENORM_CONFLATION_COLLECTION,
-    NODENORM_FILE_COLLECTION,
+    NODENORM_LARGE_DOWNLOAD_CHUNK_OVERRIDES,
+    VERSION_URL,
 )
 
 logger = config.logger
@@ -31,23 +43,31 @@ class _RetryableRangeDownloadError(Exception):
     pass
 
 
-file_collections = {
-    "compendia": NODENORM_FILE_COLLECTION,
-    "compendia-large": NODENORM_BIG_FILE_COLLECTION,
-    "conflation": NODENORM_CONFLATION_COLLECTION,
-}
+class _RetryableReleaseMarkerError(Exception):
+    pass
 
 
 class NodeNormDumper(LastModifiedHTTPDumper):
     SRC_NAME = "nodenorm"
     SRC_ROOT_FOLDER = Path(config.DATA_ARCHIVE_ROOT) / SRC_NAME
-    SCHEDULE = "0 2 1 * *"  # Monthly updates on the 1st of every month
     AUTO_UPLOAD = True
     SUFFIX_ATTR = "release"
 
     ARCHIVE = False
     SCHEDULE = None
 
+    VERSION_URL = VERSION_URL
+    SOURCE_ROOT_URL = BABEL_OUTPUT_ROOT
+    VERSION_REQUEST_TIMEOUT = 30
+    VERSION_REQUEST_MAX_ATTEMPTS = 4
+    VERSION_REQUEST_BACKOFF_SECONDS = 2
+    VERSION_REQUEST_JITTER_RATIO = 0.25
+    ARTIFACT_INDEX_REQUEST_TIMEOUT = 30
+
+    LARGE_DOWNLOAD_CHUNK_OVERRIDES = NODENORM_LARGE_DOWNLOAD_CHUNK_OVERRIDES
+    CONFLATION_COLLECTION = NODENORM_CONFLATION_COLLECTION
+
+    MAX_PARALLEL_NORMAL_FILES = 4
     MAX_PARALLEL_LARGE_FILES = 2
     LARGE_FILE_RANGE_WORKERS = 8
     NORMAL_FILE_RANGE_WORKERS = 2
@@ -66,34 +86,115 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         super().__init__(src_name, src_root_folder, log_folder, archive)
         self.to_dump_large = []
 
+    def _get_artifact_filenames(
+        self, release_url: str, artifact_directory: str
+    ) -> tuple[str, ...]:
+        index_url = f"{release_url}/{artifact_directory}/"
+        response = None
+        try:
+            response = self.client.get(
+                index_url,
+                timeout=self.ARTIFACT_INDEX_REQUEST_TIMEOUT,
+            )
+            if response.status_code >= 400:
+                raise DumperException(
+                    f"Unable to read NodeNorm {artifact_directory} inventory "
+                    f"'{index_url}' (status: {response.status_code}, "
+                    f"reason: {response.reason})"
+                )
+            try:
+                return artifact_filenames_from_index(response.text)
+            except NodeNormReleaseError as exc:
+                raise DumperException(
+                    f"Invalid NodeNorm {artifact_directory} inventory "
+                    f"'{index_url}': {exc}"
+                ) from exc
+        except requests_exceptions.RequestException as exc:
+            raise DumperException(
+                f"Unable to read NodeNorm {artifact_directory} inventory "
+                f"'{index_url}': {exc}"
+            ) from exc
+        finally:
+            if response is not None:
+                response.close()
+
     def create_todump_list(self, force: bool = False) -> None:
+        self.to_dump = []
+        self.to_dump_large = []
         self.set_release()
-        local_datafolder = Path(self.current_data_folder)
 
-        for nodenorm_file in file_collections["compendia"]:
+        release_url = f"{self.SOURCE_ROOT_URL}/{self.release}"
+        compendia = self._get_artifact_filenames(release_url, "compendia")
+        conflations = self._get_artifact_filenames(release_url, "conflation")
+        configured_conflations = set(self.CONFLATION_COLLECTION)
+        if set(conflations) != configured_conflations:
+            missing = sorted(configured_conflations - set(conflations))
+            unsupported = sorted(set(conflations) - configured_conflations)
+            details = []
+            if missing:
+                details.append("missing: " + ", ".join(missing))
+            if unsupported:
+                details.append("unsupported: " + ", ".join(unsupported))
+            raise DumperException(
+                "Babel conflation inventory does not match the NodeNorm loader "
+                f"({'; '.join(details)})"
+            )
+        self.release_manifest = make_release_manifest(
+            self.release, compendia, conflations
+        )
+
+        if not force and self.current_release:
+            try:
+                validate_release(self.current_release)
+                if self.release == self.current_release:
+                    current_data_folder = Path(self.current_data_folder)
+                    current_manifest = read_release_manifest(current_data_folder)
+                    if current_manifest == self.release_manifest:
+                        local_compendium_paths(current_data_folder)
+                        self.logger.info(
+                            "NodeNorm release %s and its artifact inventory are "
+                            "already current",
+                            self.release,
+                        )
+                        return
+                    self.logger.warning(
+                        "NodeNorm release %s has a changed artifact inventory; "
+                        "rebuilding it",
+                        self.release,
+                    )
+            except NodeNormReleaseError:
+                self.logger.warning(
+                    "Current NodeNorm release %r or its local artifact inventory is "
+                    "invalid; downloading %s",
+                    self.current_release,
+                    self.release,
+                )
+
+        local_datafolder = Path(self.new_data_folder)
+
+        for nodenorm_file in self.release_manifest.compendia:
+            file_partitions = self.LARGE_DOWNLOAD_CHUNK_OVERRIDES.get(nodenorm_file)
+            if file_partitions is None:
+                self.to_dump.append(
+                    {
+                        "remote": f"{release_url}/compendia/{nodenorm_file}",
+                        "local": str(local_datafolder.joinpath(nodenorm_file)),
+                    }
+                )
+            else:
+                self.to_dump_large.append(
+                    {
+                        "remoteurl": f"{release_url}/compendia/{nodenorm_file}",
+                        "localfile": str(local_datafolder.joinpath(nodenorm_file)),
+                        "num_partitions": file_partitions,
+                    }
+                )
+
+        for nodenorm_file in self.release_manifest.conflations:
             self.to_dump.append(
                 {
-                    "remote": f"{BASE_URL}/compendia/{nodenorm_file}",
+                    "remote": f"{release_url}/conflation/{nodenorm_file}",
                     "local": str(local_datafolder.joinpath(nodenorm_file)),
-                }
-            )
-
-        for nodenorm_file in file_collections["conflation"]:
-            self.to_dump.append(
-                {
-                    "remote": f"{BASE_URL}/conflation/{nodenorm_file}",
-                    "local": str(local_datafolder.joinpath(nodenorm_file)),
-                }
-            )
-
-        for nodenorm_file, file_partitions in file_collections[
-            "compendia-large"
-        ].items():
-            self.to_dump_large.append(
-                {
-                    "remoteurl": f"{BASE_URL}/compendia/{nodenorm_file}",
-                    "localfile": str(local_datafolder.joinpath(nodenorm_file)),
-                    "num_partitions": file_partitions,
                 }
             )
 
@@ -101,26 +202,34 @@ class NodeNormDumper(LastModifiedHTTPDumper):
     async def do_dump(self, job_manager: JobManager = None):
         await self._handle_normal_size_files(job_manager)
         await self._handle_large_size_files(job_manager)
+        write_release_manifest(self.new_data_folder, self.release_manifest)
+        local_compendium_paths(self.new_data_folder)
         self.logger.info("%s successfully downloaded", self.SRC_NAME)
 
     async def _handle_normal_size_files(self, job_manager: JobManager):
         self.logger.info("%d file(s) to download (normal size)", len(self.to_dump))
-        jobs = []
         self.unprepare()
-        for file_mapping in self.to_dump:
-            remote = file_mapping["remote"]
-            local = file_mapping["local"]
 
-            pinfo = self.get_pinfo()
-            pinfo["step"] = "dump"
-            pinfo["description"] = remote
+        for batch_start in range(0, len(self.to_dump), self.MAX_PARALLEL_NORMAL_FILES):
+            jobs = []
+            batch = self.to_dump[
+                batch_start : batch_start + self.MAX_PARALLEL_NORMAL_FILES
+            ]
+            for file_mapping in batch:
+                remote = file_mapping["remote"]
+                local = file_mapping["local"]
 
-            job = await job_manager.defer_to_process(
-                pinfo, partial(self.download, remote, local)
-            )
-            jobs.append(job)
+                pinfo = self.get_pinfo()
+                pinfo["step"] = "dump"
+                pinfo["description"] = remote
 
-        await asyncio.gather(*jobs)
+                job = await job_manager.defer_to_process(
+                    pinfo, partial(self.download, remote, local)
+                )
+                jobs.append(job)
+
+            await asyncio.gather(*jobs)
+
         self.to_dump = []
 
     async def _handle_large_size_files(self, job_manager: JobManager):
@@ -203,9 +312,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         if headers is None:
             chunks = self.get_range_chunks(remoteurl, num_partitions)
         else:
-            chunks = self.get_range_chunks(
-                remoteurl, num_partitions, headers=headers
-            )
+            chunks = self.get_range_chunks(remoteurl, num_partitions, headers=headers)
         chunk_paths = [
             Path(f"{local_path}.part{index}") for index in range(len(chunks))
         ]
@@ -213,9 +320,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         workers = min(max_workers, len(chunks))
         future_to_chunk = {}
         try:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=workers
-            ) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 for chunk_path, (chunk_start, chunk_end) in zip(chunk_paths, chunks):
                     download_arguments = {
                         "url": remoteurl,
@@ -268,38 +373,67 @@ class NodeNormDumper(LastModifiedHTTPDumper):
         request_arguments = {"timeout": self.RANGE_REQUEST_TIMEOUT}
         if headers is not None:
             request_arguments["headers"] = {
-                key: value
-                for key, value in headers.items()
-                if key.lower() != "range"
+                key: value for key, value in headers.items() if key.lower() != "range"
             }
-        try:
-            response = self.client.head(url, **request_arguments)
-        except requests_exceptions.RequestException as exc:
-            raise DumperException(
-                f"Unable to determine size of '{url}': {exc}"
-            ) from exc
 
-        try:
-            if response.status_code >= 400:
-                raise DumperException(
-                    f"Unable to determine size of '{url}' "
-                    f"(status: {response.status_code}, reason: {response.reason})"
-                )
-            content_length = response.headers.get("Content-Length")
+        for attempt in range(1, self.RANGE_DOWNLOAD_MAX_ATTEMPTS + 1):
+            response = None
+            retry_error = None
             try:
-                size = int(content_length)
-            except (TypeError, ValueError) as exc:
+                response = self.client.head(url, **request_arguments)
+                if response.status_code >= 400:
+                    message = (
+                        f"Unable to determine size of '{url}' "
+                        f"(status: {response.status_code}, "
+                        f"reason: {response.reason})"
+                    )
+                    if response.status_code not in self.RETRYABLE_HTTP_STATUS_CODES:
+                        raise DumperException(message)
+                    retry_error = DumperException(message)
+                else:
+                    content_length = response.headers.get("Content-Length")
+                    try:
+                        size = int(content_length)
+                    except (TypeError, ValueError) as exc:
+                        raise DumperException(
+                            f"Unable to determine size of '{url}': "
+                            f"invalid Content-Length {content_length!r}"
+                        ) from exc
+                    if size <= 0:
+                        raise DumperException(
+                            f"Unable to determine size of '{url}': "
+                            "invalid Content-Length"
+                        )
+                    return size
+            except (
+                requests_exceptions.ConnectionError,
+                requests_exceptions.Timeout,
+            ) as exc:
+                retry_error = exc
+            except requests_exceptions.RequestException as exc:
                 raise DumperException(
-                    f"Unable to determine size of '{url}': "
-                    f"invalid Content-Length {content_length!r}"
+                    f"Unable to determine size of '{url}': {exc}"
                 ) from exc
-            if size <= 0:
+            finally:
+                if response is not None:
+                    response.close()
+
+            if attempt == self.RANGE_DOWNLOAD_MAX_ATTEMPTS:
                 raise DumperException(
-                    f"Unable to determine size of '{url}': invalid Content-Length"
-                )
-            return size
-        finally:
-            response.close()
+                    f"Unable to determine size of '{url}' after {attempt} "
+                    f"attempts: {retry_error}"
+                ) from retry_error
+
+            delay = self.RANGE_DOWNLOAD_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            self.logger.warning(
+                "Retrying size request for '%s' in %d seconds after "
+                "attempt %d failed: %s",
+                url,
+                delay,
+                attempt,
+                retry_error,
+            )
+            time.sleep(delay)
 
     def get_range_chunks(
         self, url: str, num_partitions: int = 10, headers: dict = None
@@ -359,10 +493,7 @@ class NodeNormDumper(LastModifiedHTTPDumper):
                         f"Error while downloading '{url}' range {start}-{end} "
                         f"(status: {response.status_code}, reason: {response.reason})"
                     )
-                    if (
-                        response.status_code
-                        not in self.RETRYABLE_HTTP_STATUS_CODES
-                    ):
+                    if response.status_code not in self.RETRYABLE_HTTP_STATUS_CODES:
                         raise DumperException(message)
                     raise _RetryableRangeDownloadError(message)
 
@@ -445,19 +576,130 @@ class NodeNormDumper(LastModifiedHTTPDumper):
             chunk_path.unlink(missing_ok=True)
             Path(f"{chunk_path}.tmp").unlink(missing_ok=True)
 
+    def get_release(self) -> str:
+        """Return the official release named by RENCI's VERSION.txt marker."""
+
+        for attempt in range(1, self.VERSION_REQUEST_MAX_ATTEMPTS + 1):
+            response = None
+            retry_error = None
+            try:
+                response = self.client.get(
+                    self.VERSION_URL,
+                    timeout=self.VERSION_REQUEST_TIMEOUT,
+                )
+                if response.status_code >= 400:
+                    message = (
+                        f"Unable to read NodeNorm release marker '{self.VERSION_URL}' "
+                        f"(status: {response.status_code}, reason: {response.reason})"
+                    )
+                    if response.status_code not in self.RETRYABLE_HTTP_STATUS_CODES:
+                        raise DumperException(message)
+                    retry_error = _RetryableReleaseMarkerError(message)
+                else:
+                    try:
+                        return parse_version_marker(response.text)
+                    except NodeNormReleaseError as exc:
+                        raise DumperException(
+                            f"Invalid NodeNorm release marker '{self.VERSION_URL}': "
+                            f"{exc}"
+                        ) from exc
+            except (
+                requests_exceptions.InvalidURL,
+                requests_exceptions.SSLError,
+            ) as exc:
+                raise DumperException(
+                    f"Unable to read NodeNorm release marker '{self.VERSION_URL}': "
+                    f"{exc}"
+                ) from exc
+            except (
+                requests_exceptions.ChunkedEncodingError,
+                requests_exceptions.ConnectionError,
+                requests_exceptions.ContentDecodingError,
+                requests_exceptions.Timeout,
+            ) as exc:
+                retry_error = exc
+            except requests_exceptions.RequestException as exc:
+                raise DumperException(
+                    f"Unable to read NodeNorm release marker '{self.VERSION_URL}': "
+                    f"{exc}"
+                ) from exc
+            finally:
+                if response is not None:
+                    response.close()
+
+            if attempt == self.VERSION_REQUEST_MAX_ATTEMPTS:
+                raise DumperException(
+                    f"Unable to read NodeNorm release marker '{self.VERSION_URL}' "
+                    f"after {attempt} attempts: {retry_error}"
+                ) from retry_error
+
+            delay = self._release_marker_retry_delay(attempt, response)
+            self.logger.warning(
+                "Retrying NodeNorm release marker '%s' in %.2f seconds after "
+                "attempt %d/%d failed: %s",
+                self.VERSION_URL,
+                delay,
+                attempt,
+                self.VERSION_REQUEST_MAX_ATTEMPTS,
+                retry_error,
+            )
+            time.sleep(delay)
+
+        raise AssertionError("NodeNorm release marker retry loop ended unexpectedly")
+
+    def _release_marker_retry_delay(self, attempt: int, response) -> float:
+        backoff = self.VERSION_REQUEST_BACKOFF_SECONDS * (2 ** (attempt - 1))
+        delay = backoff + random.uniform(0, backoff * self.VERSION_REQUEST_JITTER_RATIO)
+        retry_after = self._retry_after_seconds(response)
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        return delay
+
+    def _retry_after_seconds(self, response) -> float | None:
+        if response is None:
+            return None
+        retry_after = response.headers.get("Retry-After")
+        if not retry_after:
+            return None
+
+        try:
+            delay = float(retry_after)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        if not math.isfinite(delay) or delay < 0:
+            return None
+        return delay
+
     def set_release(self) -> None:
-        """
-        Parses the BASE_URL to extract the data from the url pathing
-        """
-        parse_result = urlparse(BASE_URL)
-        self.release = parse_result.path.split("/")[-1]
+        """Set the SDK release value from RENCI's authoritative marker."""
+
+        self.release = self.get_release()
 
     def post_dump(self, *args, **kwargs):
-        # Force creation of the to_dump collection
-        self.create_todump_list(force=True)
-        local_zip_file = self.to_dump[0]["local"]
-        data_directory = Path(local_zip_file).parent
+        data_directory = Path(self.new_data_folder)
+        expected_release = getattr(self, "release", None) or self.current_release
+        try:
+            validate_release(expected_release)
+            manifest = read_release_manifest(data_directory)
+            if manifest.release != expected_release:
+                raise NodeNormReleaseError(
+                    f"local manifest release {manifest.release!r} does not match "
+                    f"selected release {expected_release!r}"
+                )
+            local_compendium_paths(data_directory)
+        except NodeNormReleaseError as exc:
+            raise DumperException(
+                f"Downloaded NodeNorm release {expected_release} is invalid: {exc}"
+            ) from exc
         self._generate_conflation_database(data_directory)
+        super().post_dump(*args, **kwargs)
 
     def _generate_conflation_database(
         self, data_directory: Union[str, Path]

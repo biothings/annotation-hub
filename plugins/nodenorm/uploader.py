@@ -5,7 +5,7 @@ from biothings import config
 from biothings.hub.dataload.uploader import BaseSourceUploader
 from biothings.utils.manager import JobManager
 
-from .static import BASE_URL
+from .static import VERSION_URL
 from .worker import upload_process
 
 logger = config.logger
@@ -13,7 +13,7 @@ logger = config.logger
 
 class NodeNormUploader(BaseSourceUploader):
     name = "nodenorm"
-    __metadata__ = {"src_meta": {"url": BASE_URL}}
+    __metadata__ = {"src_meta": {"url": VERSION_URL}}
 
     async def update_data(self, batch_size: int, job_manager: JobManager = None):
         """
