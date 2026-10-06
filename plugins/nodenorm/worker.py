@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 import zlib
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
@@ -18,12 +19,11 @@ import pymongo
 from pymongo.errors import BulkWriteError
 
 from biothings import config
-from biothings.utils.dataload import merge_struct
 from biothings.utils.serializer import json_loads
 from biothings.utils.hub_db import get_src_db
 from biothings.utils.common import iter_n
 
-from .release import local_compendium_paths
+from .release import local_compendium_paths, read_duplicate_clique_leaders
 from .static import (
     CONFLATION_LOOKUP_DATABASE,
     DRUG_CHEMICAL_IDENTIFIER_FILES,
@@ -48,10 +48,19 @@ NODENORM_IDENTIFIER_COMMIT_BATCHES = 8
 IDENTIFIER_WRITER_STOP = None
 IDENTIFIER_QUEUES = None
 IDENTIFIER_WRITER_FAILED = None
+DUPLICATE_CLIQUE_LEADERS = None
 
 
 class NodeNormCollectionValidationError(RuntimeError):
     """The uploaded collection does not satisfy NodeNorm's CURIE contract."""
+
+
+@dataclass(frozen=True)
+class UploadPartitionResult:
+    """Bounded upload statistics; never return whole identifier arrays to the parent."""
+
+    identifier_count: int
+    duplicate_leader_counts: dict[tuple[str, str], int]
 
 
 @dataclass(frozen=True)
@@ -116,6 +125,7 @@ def _configure_sqlite_tmpdir() -> Path:
 def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     validation_mode = _curie_validation_mode()
     compendium_paths = local_compendium_paths(data_folder)
+    duplicate_clique_leaders = read_duplicate_clique_leaders(data_folder)
     _configure_sqlite_tmpdir()
 
     create_identifiers_table(data_folder)
@@ -154,7 +164,11 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
             max_workers=NODENORM_WORKER_COUNT,
             mp_context=process_context,
             initializer=_configure_identifier_writer,
-            initargs=(identifier_queues, identifier_writer_failed),
+            initargs=(
+                identifier_queues,
+                identifier_writer_failed,
+                duplicate_clique_leaders,
+            ),
         ) as executor:
             process_futures = set()
             try:
@@ -168,22 +182,24 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
                     future = executor.submit(subset_upload_worker, **task)
                     process_futures.add(future)
 
-                total_document_count = 0
+                total_identifier_count = 0
+                observed_leader_counts = Counter()
                 for index, future in enumerate(
                     concurrent.futures.as_completed(process_futures)
                 ):
                     # Completed futures retain their result; drop our reference
                     # before waiting on the next upload task.
                     process_futures.discard(future)
-                    identifier_count = future.result()
-                    total_document_count += identifier_count
+                    result = future.result()
+                    total_identifier_count += result.identifier_count
+                    observed_leader_counts.update(result.duplicate_leader_counts)
                     logger.debug(
-                        "Task %s completed | Update %s identifiers | Total identifiers %s",
+                        "Task %s completed | Retained %s identifiers | Total identifiers %s",
                         index,
-                        identifier_count,
-                        total_document_count,
+                        result.identifier_count,
+                        total_identifier_count,
                     )
-                    del identifier_count
+                    del result
                     del future
             except Exception as upload_exception:
                 logger.exception(upload_exception)
@@ -208,10 +224,45 @@ def upload_process(data_folder: Union[str, Path], collection_name: str) -> int:
     if upload_error is not None:
         raise upload_error
 
+    # Every declared source candidate must have been seen exactly once. This
+    # also checks discarded candidates, which never reach Mongo or SQLite, and
+    # prevents a missing winning record from silently discarding an entire clique.
+    _validate_duplicate_leader_counts(duplicate_clique_leaders, observed_leader_counts)
     _prepare_collection_for_promotion(
         data_folder, collection_name, validation_mode=validation_mode
     )
-    return int(total_document_count)
+    return int(total_identifier_count)
+
+
+def _validate_duplicate_leader_counts(duplicate_clique_leaders, observed_counts):
+    """Require the input to match the release report before collection promotion."""
+    expected = {
+        (leader, filename)
+        for leader, filenames in duplicate_clique_leaders.items()
+        for filename in filenames
+    }
+    violations = []
+    violation_count = 0
+    for leader, filename in sorted(expected | set(observed_counts)):
+        expected_count = 1 if (leader, filename) in expected else 0
+        actual_count = observed_counts.get((leader, filename), 0)
+        if actual_count != expected_count:
+            violation_count += 1
+            if len(violations) < NODENORM_VALIDATION_FAILURE_SAMPLE_SIZE:
+                violations.append(
+                    f"{leader!r} in {filename}: expected {expected_count}, saw {actual_count}"
+                )
+    if violation_count:
+        raise NodeNormCollectionValidationError(
+            f"Duplicate clique leader report does not match the input: "
+            f"{violation_count} candidate(s) differ. " + "; ".join(violations)
+        )
+    logger.info(
+        "Validated %s duplicate clique leader(s) across %s source candidates; "
+        "kept the first manifest compendium for each leader",
+        len(duplicate_clique_leaders),
+        len(expected),
+    )
 
 
 def _prepare_collection_for_promotion(
@@ -248,11 +299,15 @@ def _prepare_collection_for_promotion(
     )
 
 
-def _configure_identifier_writer(identifier_queues, identifier_writer_failed):
-    global IDENTIFIER_QUEUES, IDENTIFIER_WRITER_FAILED
+def _configure_identifier_writer(
+    identifier_queues, identifier_writer_failed, duplicate_clique_leaders
+):
+    global IDENTIFIER_QUEUES, IDENTIFIER_WRITER_FAILED, DUPLICATE_CLIQUE_LEADERS
 
     IDENTIFIER_QUEUES = identifier_queues
     IDENTIFIER_WRITER_FAILED = identifier_writer_failed
+    # Serialize this small release-wide map once per process, not once per task.
+    DUPLICATE_CLIQUE_LEADERS = duplicate_clique_leaders
 
 
 def _build_offset_tasks(
@@ -423,7 +478,8 @@ def subset_upload_worker(
     offset_end: int,
     collection_name: str,
     conflation_database: str = None,
-) -> int:
+    duplicate_clique_leaders: dict[str, tuple[str, ...]] | None = None,
+) -> UploadPartitionResult:
     """
     Internal function for handling the multipart uploading of the file in partitions
 
@@ -434,9 +490,15 @@ def subset_upload_worker(
     data files as it's generated post-dump. We can just derived it at run-time from the provided
     data filepath
 
-    Afterwards the data processing is straight forward, we effectively don't transform the state of
-    the nodenorm files
+    Keep one complete source clique per reported leader, before identifier
+    accounting or conflation enrichment. The sorted release manifest defines
+    source precedence, independently of worker completion or insertion order.
     """
+    input_file = Path(input_file)
+    if duplicate_clique_leaders is None:
+        duplicate_clique_leaders = DUPLICATE_CLIQUE_LEADERS
+    if duplicate_clique_leaders is None:
+        raise RuntimeError("Duplicate clique leader report was not configured")
     logger.info(
         "Starting bulk upload to backend %s [%s|%s]",
         input_file,
@@ -452,35 +514,74 @@ def subset_upload_worker(
         database=upload_database, name=collection_name
     )
 
-    with open(input_file, encoding="utf-8") as file_handle:
-        buffer = []
-        identifier_batch = []
-        identifier_count = 0
-        canonical_identifiers = []
-        file_handle.seek(offset_start)
-        while file_handle.tell() < offset_end:
-            line = file_handle.readline()
-            doc = json_loads(line)
+    identifier_count = 0
+    skipped_document_count = 0
+    skipped_identifier_count = 0
+    observed_leader_counts = Counter()
+    try:
+        with open(input_file, encoding="utf-8") as file_handle:
+            buffer = []
+            identifier_batch = []
+            canonical_identifiers = []
+            file_handle.seek(offset_start)
+            while file_handle.tell() < offset_end:
+                line = file_handle.readline()
+                doc = json_loads(line)
+                _validate_source_clique(doc, input_file)
 
-            canonical_identifier = doc["identifiers"][0]["i"]
-            canonical_identifiers.append(canonical_identifier)
-            doc["_id"] = canonical_identifier
-            try:
-                doc["ic"] = float(doc["ic"])
-            except (TypeError, ValueError):
-                doc["ic"] = 0.0
+                canonical_identifier = doc["identifiers"][0]["i"]
+                candidates = duplicate_clique_leaders.get(canonical_identifier)
+                if candidates is not None:
+                    if input_file.name not in candidates:
+                        raise ValueError(
+                            f"Duplicate clique leader {canonical_identifier!r} occurs in "
+                            f"unreported compendium {input_file.name!r}; expected {candidates!r}"
+                        )
+                    observed_leader_counts[(canonical_identifier, input_file.name)] += 1
+                    if input_file.name != candidates[0]:
+                        skipped_document_count += 1
+                        skipped_identifier_count += len(doc["identifiers"])
+                        logger.info(
+                            "Skipping reported duplicate clique leader %s from %s; "
+                            "selected source=%s, skipped identifier entries=%s, "
+                            "identifier sample=%s (may also occur in retained cliques)",
+                            canonical_identifier,
+                            input_file.name,
+                            candidates[0],
+                            len(doc["identifiers"]),
+                            [entry["i"] for entry in doc["identifiers"][:20]],
+                        )
+                        continue
 
-            buffer.append(doc)
+                canonical_identifiers.append(canonical_identifier)
+                doc["_id"] = canonical_identifier
+                try:
+                    doc["ic"] = float(doc["ic"])
+                except (TypeError, ValueError):
+                    doc["ic"] = 0.0
 
-            for identifier in doc["identifiers"]:
-                identifier_batch.append(identifier["i"])
-                identifier_count += 1
-                if len(identifier_batch) >= NODENORM_IDENTIFIER_BATCH_SIZE:
-                    _queue_identifier_batch(identifier_batch)
-                    identifier_batch = []
-                identifier["c"] = {"gp": None, "dc": None}
+                buffer.append(doc)
 
-            if len(buffer) >= buffer_size:
+                for identifier in doc["identifiers"]:
+                    identifier_batch.append(identifier["i"])
+                    identifier_count += 1
+                    if len(identifier_batch) >= NODENORM_IDENTIFIER_BATCH_SIZE:
+                        _queue_identifier_batch(identifier_batch)
+                        identifier_batch = []
+                    identifier["c"] = {"gp": None, "dc": None}
+
+                if len(buffer) >= buffer_size:
+                    if conflation_connection is not None:
+                        buffer = _update_buffer_with_conflations(
+                            buffer, canonical_identifiers, conflation_connection
+                        )
+                    _upload_buffer(
+                        collection, buffer, input_file, file_handle.tell() / offset_end
+                    )
+                    buffer = []
+                    canonical_identifiers = []
+
+            if len(buffer) > 0:
                 if conflation_connection is not None:
                     buffer = _update_buffer_with_conflations(
                         buffer, canonical_identifiers, conflation_connection
@@ -488,20 +589,48 @@ def subset_upload_worker(
                 _upload_buffer(
                     collection, buffer, input_file, file_handle.tell() / offset_end
                 )
-                buffer = []
-                canonical_identifiers = []
+            if identifier_batch:
+                _queue_identifier_batch(identifier_batch)
+    finally:
+        if conflation_connection is not None:
+            conflation_connection.close()
+    logger.info(
+        "Uploaded %s [%s|%s]: retained identifier entries=%s; skipped "
+        "duplicate cliques=%s, skipped identifier entries=%s",
+        input_file.name,
+        offset_start,
+        offset_end,
+        identifier_count,
+        skipped_document_count,
+        skipped_identifier_count,
+    )
+    return UploadPartitionResult(identifier_count, dict(observed_leader_counts))
 
-        if len(buffer) > 0:
-            if conflation_connection is not None:
-                buffer = _update_buffer_with_conflations(
-                    buffer, canonical_identifiers, conflation_connection
-                )
-            _upload_buffer(
-                collection, buffer, input_file, file_handle.tell() / offset_end
+
+def _validate_source_clique(document: dict, input_file: Path) -> None:
+    """Validate even discarded candidates; a source type is always one leaf."""
+    if not isinstance(document, dict):
+        raise ValueError(f"Invalid clique document in {input_file}: expected an object")
+    identifiers = document.get("identifiers")
+    if not isinstance(identifiers, list) or not identifiers:
+        raise ValueError(
+            f"Invalid clique identifiers in {input_file}: expected a nonempty list"
+        )
+    for identifier in identifiers:
+        if (
+            not isinstance(identifier, dict)
+            or not isinstance(identifier.get("i"), str)
+            or not identifier["i"].strip()
+        ):
+            raise ValueError(
+                f"Invalid clique identifier in {input_file}: {identifier!r}"
             )
-        if identifier_batch:
-            _queue_identifier_batch(identifier_batch)
-    return identifier_count
+    node_type = document.get("type")
+    if not isinstance(node_type, str) or not node_type.strip():
+        raise ValueError(
+            f"Invalid clique type for {identifiers[0]['i']!r} in {input_file}: "
+            f"expected a nonempty scalar string, got {node_type!r}"
+        )
 
 
 def _queue_identifier_batch(identifier_batch):
@@ -607,33 +736,19 @@ def _handle_bulk_write_error(
     collection: pymongo.collection.Collection,
     input_file: Union[str, Path],
 ):
-    logger.debug("Fixing %d records ", len(bulk_write_error.details["writeErrors"]))
-    ids = [d["op"]["_id"] for d in bulk_write_error.details["writeErrors"]]
-
-    # build hash of existing docs
-    docs = collection.find({"_id": {"$in": ids}})
-
-    hdocs = {}
-    for doc in docs:
-        hdocs[doc["_id"]] = doc
-
-    bulk = []
-    for err in bulk_write_error.details["writeErrors"]:
-        errdoc = err["op"]
-        existing = hdocs[errdoc["_id"]]
-        if errdoc is existing:
-            continue
-        assert "_id" in existing
-        _id = errdoc.pop("_id")
-        merged = merge_struct(errdoc, existing)
-
-        # update previously fetched doc. if several errors are about the same doc id,
-        # we would't merged things properly without an updated document
-        assert "_id" in merged
-        bulk.append(pymongo.UpdateOne({"_id": _id}, {"$set": merged}))
-        hdocs[_id] = merged
-
-    collection.bulk_write(bulk, ordered=False)
+    # All reported cross-compendium leader collisions were filtered before
+    # insert_many. Any remaining duplicate key (on any index), validation error,
+    # or write concern failure is unexpected and must block promotion.
+    errors = bulk_write_error.details.get("writeErrors", [])
+    logger.error(
+        "Unexpected bulk write failure in %s after duplicate leader selection; "
+        "write errors=%s, write concern errors=%s, sample (code, _id)=%s",
+        input_file,
+        len(errors),
+        len(bulk_write_error.details.get("writeConcernErrors", [])),
+        [(error.get("code"), error.get("op", {}).get("_id")) for error in errors[:20]],
+    )
+    raise bulk_write_error
 
 
 def create_identifiers_table(data_folder: Union[str, Path]) -> None:
@@ -1111,7 +1226,7 @@ def _identifier_curies(document: dict) -> list[str]:
 
 
 def _document_has_type(document: dict, node_type: str) -> bool:
-    """Support both source strings and type lists produced by duplicate merges."""
+    """Allow inspection of legacy collections; new uploads require scalar types."""
     document_types = document["type"]
     if isinstance(document_types, (list, tuple, set)):
         return node_type in document_types
@@ -1126,9 +1241,8 @@ def _deduplicate_document_identifiers(
 
     Returns the operation to apply, or None, plus whether the CURIE was left
     unresolved. Finding nothing to trim is a resolution, not a failure: the
-    shard counters record how often a CURIE was seen during upload, so a CURIE
-    counted twice can legitimately end up in one document once the duplicate
-    `_id` documents were merged.
+    shard counters record occurrences in retained input cliques, so a CURIE
+    counted twice can end up in one document after an earlier subset repair.
 
     The filter pins the identifier array this decision was made from, so a
     document another worker has since changed is left alone instead of being

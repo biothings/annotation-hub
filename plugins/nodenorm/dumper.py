@@ -19,6 +19,8 @@ from biothings.utils.manager import JobManager
 from requests import exceptions as requests_exceptions
 
 from .release import (
+    DUPLICATE_CLIQUE_LEADERS_FILENAME,
+    DUPLICATE_CLIQUE_LEADERS_RELATIVE_PATH,
     NodeNormReleaseError,
     artifact_filenames_from_index,
     local_compendium_paths,
@@ -197,6 +199,13 @@ class NodeNormDumper(LastModifiedHTTPDumper):
                     "local": str(local_datafolder.joinpath(nodenorm_file)),
                 }
             )
+
+        self.to_dump.append(
+            {
+                "remote": f"{release_url}/{DUPLICATE_CLIQUE_LEADERS_RELATIVE_PATH}",
+                "local": str(local_datafolder / DUPLICATE_CLIQUE_LEADERS_FILENAME),
+            }
+        )
 
     @override
     async def do_dump(self, job_manager: JobManager = None):
