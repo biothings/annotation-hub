@@ -13,6 +13,12 @@ changes. Named download and upload chunk maps are performance overrides only;
 they do not decide which compendia are included. Missing, empty, or malformed
 manifest artifacts block upload.
 
+Manifest schema version 2 also requires the release's
+`reports/duckdb/duplicate_clique_leaders.tsv`, downloaded alongside the compendia
+as `duplicate_clique_leaders.tsv`. Old manifests and missing or invalid reports
+require a fresh dump. The report is always downloaded from the same dated release
+as the compendia, never independently from `latest/`.
+
 
 ### Mapping
 
@@ -237,6 +243,48 @@ empirical testing was performed to evaluate this guideline. There is a blocking 
 beginning where we wait for all files to have finished being analyzed for offsets where we could
 likely start faster on a per-file completion basis 
 
+#### Duplicate clique leaders
+
+The first identifier of each clique becomes its MongoDB `_id`. When Babel lists
+that leader in several compendia, keep the complete record from the **first
+compendium in the manifest's case-insensitive filename order**. For example,
+`Gene.txt` wins over `Protein.txt`, regardless of which parallel worker finishes
+first. This is an explicit conflict policy allowed by
+[NodeNormalizationAPI #41](https://github.com/biothings/NodeNormalizationAPI/issues/41),
+not a claim of biological priority or of matching Redis's particular winner.
+No identifiers, types, labels, or other fields are merged between candidates.
+The usual information-content conversion and conflation enrichment still apply
+to the retained document.
+
+Every source document, including a discarded candidate, must have a nonempty
+scalar string `type`. Losing candidates are skipped before identifier counting,
+upload buffering, and conflation enrichment. Their leader, source filename,
+selected source, identifier count, and a bounded identifier sample are logged.
+Identifiers unique to a discarded clique can be lost under this policy; skipped
+entry counts are not counts of distinct lost CURIEs, since retained cliques may
+contain the same identifiers.
+
+Each worker returns only its retained identifier count and occurrence counts for
+reported `(leader, compendium)` pairs. The parent checks that every declared
+candidate occurred exactly once before allowing collection promotion. This
+detects missing winners and repeated records, even when a record was discarded.
+A known leader in an undeclared compendium fails immediately. Header-only reports
+are valid for releases without duplicate leaders; same-file duplicate leaders are
+ambiguous and rejected. All remaining MongoDB bulk errors propagate, including
+unreported `_id` collisions, other unique-index violations, and write-concern
+failures. Source validation and report reconciliation are mandatory even when
+`NODENORM_CURIE_VALIDATION_MODE` is `off`.
+
+This selects whole source cliques during ingestion. The subsequent cleanup of
+CURIEs shared by different leaders remains in place and may still trim identifiers
+or delete subset documents; its broader conflict policy is unchanged.
+
+To roll out the fix, rerun the dump to obtain a schema-v2 manifest and its report,
+upload into a new temporary collection, and rebuild/publish the Elasticsearch
+index through the usual Hub workflow. Reindexing the old merged MongoDB collection
+does not repair it. The API guard against legacy list-valued source types belongs
+in the separate NodeNormalizationAPI repository.
+
 
 ### Post Upload Processing (MongoDB)
 
@@ -288,8 +336,9 @@ So how do we fix this?
 
 ###### Sharded sqlite3 identifier tables
 
-The NodeNorm uploader tracks every identifier encountered across all documents. Duplicate
-identifiers increment a count so they can be corrected after the MongoDB upload. The current
+The NodeNorm uploader tracks every identifier in retained input documents. Skipped
+duplicate-leader candidates never enter these counters. Duplicate identifiers increment
+a count so they can be corrected after the MongoDB upload. The current
 implementation deterministically routes identifiers across eight SQLite database shards:
 
 ```SQL
@@ -331,13 +380,11 @@ no identifiers always block the upload.
 
 This leads to the different ways we have to resolve the duplicate CURIES:
 
-* Duplicate CURIE case 1: Identical documents besides the typing
+* Duplicate CURIE case 1: The same clique leader in multiple compendia
 
-We get the exact same document, but the typing is different depending on the conflation. We're
-automatically merging this and need a way of representing the type, it normally doesn't have the
-`biolink:Protein` typing
-
-Log: `Replace 1 document to trim all identifiers except the first due to them all being identical: {'_id': 'ENSEMBL:YDR387C', 'type': ['biolink:Protein', 'biolink:Gene'], 'ic': 0.0, 'identifiers': [{'i': 'ENSEMBL:YDR387C', 'd': [], 't': [], 'c': {'gp': None, 'dc': None}}], 'preferred_name': '', 'taxa': []}`
+This case is resolved before insertion using the release report and the filename
+priority described above. The former structural merge produced types such as
+`["biolink:Protein", "biolink:Gene"]`; new uploads preserve one scalar leaf type.
 
 Examining the compendium files we have the following two documents:
 
@@ -349,6 +396,9 @@ Gene.txt
 Protein.txt
 143744272:{"type": "biolink:Protein", "ic": null, "identifiers": [{"i": "ENSEMBL:YDR387C", "d": [], "t": []}], "preferred_name": "", "taxa": []}
 ```
+
+For this reported pair, only the `Gene.txt` candidate is retained. Its stored
+`type` stays `"biolink:Gene"`; the Protein candidate is logged and skipped.
 
 * Duplicate CURIE case 2: Duplication across documents with one being an obvious subset
 

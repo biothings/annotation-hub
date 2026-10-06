@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -27,6 +28,7 @@ COMPENDIA_INDEX = index_html(
     "notes.txt.gz",
 )
 CONFLATION_INDEX = index_html(*CONFLATIONS)
+DUPLICATE_REPORT_HEADER = "clique_leader\tfilenames\tbiolink_types\tclique_identifier_counts\tclique_leader_count\n"
 
 
 class FakeResponse:
@@ -147,6 +149,9 @@ def write_release_files(nodenorm_modules, data_folder, release="2025sep1"):
         release, COMPENDIA, CONFLATIONS
     )
     nodenorm_modules.release.write_release_manifest(data_folder, manifest)
+    (
+        data_folder / nodenorm_modules.release.DUPLICATE_CLIQUE_LEADERS_FILENAME
+    ).write_text(DUPLICATE_REPORT_HEADER, encoding="utf-8")
     return manifest
 
 
@@ -401,6 +406,7 @@ def test_new_release_queues_immutable_urls_in_new_folder(nodenorm_modules, tmp_p
         "https://stars.renci.org/var/babel_outputs/2025sep1/compendia/FutureType.txt",
         "https://stars.renci.org/var/babel_outputs/2025sep1/conflation/DrugChemical.txt",
         "https://stars.renci.org/var/babel_outputs/2025sep1/conflation/GeneProtein.txt",
+        "https://stars.renci.org/var/babel_outputs/2025sep1/reports/duckdb/duplicate_clique_leaders.tsv",
     }
     assert [item["remoteurl"] for item in dumper.to_dump_large] == [
         "https://stars.renci.org/var/babel_outputs/2025sep1/compendia/Protein.txt"
@@ -505,7 +511,7 @@ def test_force_queues_current_release_and_resets_queues(nodenorm_modules, tmp_pa
 
     dumper.create_todump_list(force=True)
 
-    assert len(dumper.to_dump) == 5
+    assert len(dumper.to_dump) == 6
     assert len(dumper.to_dump_large) == 1
     assert all(item.get("remote") != "stale" for item in dumper.to_dump)
     assert all(item.get("remoteurl") != "stale" for item in dumper.to_dump_large)
@@ -571,6 +577,9 @@ def test_do_dump_persists_and_validates_release_manifest(nodenorm_modules, tmp_p
     data_folder.mkdir(parents=True)
     for filename in (*COMPENDIA, *CONFLATIONS):
         (data_folder / filename).write_text("{}\n", encoding="utf-8")
+    (
+        data_folder / nodenorm_modules.release.DUPLICATE_CLIQUE_LEADERS_FILENAME
+    ).write_text(DUPLICATE_REPORT_HEADER, encoding="utf-8")
     dumper.release_manifest = nodenorm_modules.release.make_release_manifest(
         "2025sep1", COMPENDIA, CONFLATIONS
     )
@@ -653,3 +662,261 @@ def test_post_only_run_uses_current_release_manifest(nodenorm_modules, tmp_path)
 
 def test_production_retains_single_snapshot(nodenorm_modules):
     assert nodenorm_modules.dumper.NodeNormDumper.ARCHIVE is False
+
+
+def test_duplicate_report_uses_manifest_order_and_preserves_declared_sources(
+    nodenorm_modules, tmp_path
+):
+    write_release_files(nodenorm_modules, tmp_path)
+    report = tmp_path / nodenorm_modules.release.DUPLICATE_CLIQUE_LEADERS_FILENAME
+    report.write_text(
+        DUPLICATE_REPORT_HEADER
+        + "EX:1\t[Protein, CellLine, Food]\t['biolink:Protein', 'biolink:CellLine', "
+        "'biolink:Food']\t[2, 1, 4]\t3\n",
+        encoding="utf-8",
+    )
+
+    assert nodenorm_modules.release.read_duplicate_clique_leaders(tmp_path) == {
+        "EX:1": ("CellLine.txt", "Food.txt", "Protein.txt")
+    }
+
+
+def test_header_only_duplicate_report_is_valid(nodenorm_modules, tmp_path):
+    write_release_files(nodenorm_modules, tmp_path)
+
+    assert nodenorm_modules.release.read_duplicate_clique_leaders(tmp_path) == {}
+
+
+@pytest.mark.parametrize(
+    "rows, expected",
+    [
+        ("", {}),
+        ("EX:1\t2\t[Protein, Food]\n", {"EX:1": ("Food.txt", "Protein.txt")}),
+    ],
+)
+def test_legacy_duplicate_report_without_metadata_is_valid(
+    nodenorm_modules, tmp_path, rows, expected
+):
+    write_release_files(nodenorm_modules, tmp_path)
+    (tmp_path / nodenorm_modules.release.DUPLICATE_CLIQUE_LEADERS_FILENAME).write_text(
+        "clique_leader\tclique_leader_count\tfilenames\n" + rows,
+        encoding="utf-8",
+    )
+
+    assert nodenorm_modules.release.read_duplicate_clique_leaders(tmp_path) == expected
+
+
+@pytest.mark.parametrize(
+    "column, value, error",
+    [
+        ("biolink_types", "['biolink:Protein', 'biolink:Food']", None),
+        ("clique_identifier_counts", "[1, 2]", None),
+        ("biolink_types", "[biolink:Protein, biolink:Food]", "quoted strings"),
+        ("biolink_types", "['biolink:Protein']", "list lengths"),
+        ("clique_identifier_counts", "[0, 2]", "positive integers"),
+        ("clique_identifier_counts", "[1]", "list lengths"),
+    ],
+)
+def test_duplicate_report_optional_metadata_validated_independently(
+    nodenorm_modules, tmp_path, column, value, error
+):
+    write_release_files(nodenorm_modules, tmp_path)
+    (tmp_path / nodenorm_modules.release.DUPLICATE_CLIQUE_LEADERS_FILENAME).write_text(
+        f"clique_leader\tclique_leader_count\tfilenames\t{column}\n"
+        f"EX:1\t2\t[Protein, Food]\t{value}\n",
+        encoding="utf-8",
+    )
+
+    if error:
+        with pytest.raises(nodenorm_modules.release.NodeNormReleaseError, match=error):
+            nodenorm_modules.release.read_duplicate_clique_leaders(tmp_path)
+    else:
+        assert nodenorm_modules.release.read_duplicate_clique_leaders(tmp_path) == {
+            "EX:1": ("Food.txt", "Protein.txt")
+        }
+
+
+@pytest.mark.parametrize(
+    "report_text, message",
+    [
+        ("", "required columns"),
+        ("clique_leader\tfilenames\n", "required columns"),
+        (
+            DUPLICATE_REPORT_HEADER.replace("filenames", "clique_leader"),
+            "required columns",
+        ),
+        (DUPLICATE_REPORT_HEADER + "EX:1\t[CellLine, Food]\n", "match its header"),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[CellLine, Food]\t['biolink:CellLine', 'biolink:Food']\t[1, 2]\t2\textra\n",
+            "match its header",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "\t[CellLine, Food]\t['biolink:CellLine', 'biolink:Food']\t[1, 2]\t2\n",
+            "CURIE",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[CellLine, Food]\t['biolink:CellLine', 'biolink:Food']\t[1, 2]\t2\n"
+            + "EX:1\t[CellLine, Protein]\t['biolink:CellLine', 'biolink:Protein']\t[1, 2]\t2\n",
+            "repeated clique_leader",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[Food, Food]\t['biolink:Food', 'biolink:Food']\t[1, 2]\t2\n",
+            "repeated compendium",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[Missing, Food]\t['biolink:CellLine', 'biolink:Food']\t[1, 2]\t2\n",
+            "unknown compendium",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[CellLine.txt, Food]\t['biolink:CellLine', 'biolink:Food']\t[1, 2]\t2\n",
+            "unknown compendium",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\tCellLine, Food\t['biolink:CellLine', 'biolink:Food']\t[1, 2]\t2\n",
+            "bracketed list",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[CellLine, ]\t['biolink:CellLine', 'biolink:Food']\t[1, 2]\t2\n",
+            "invalid list item",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[CellLine]\t['biolink:CellLine']\t[1]\t1\n",
+            "at least 2",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[CellLine, Food]\t['biolink:CellLine', 'biolink:Food']\t[1, 2]\t3\n",
+            "list lengths",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[CellLine, Food]\t[biolink:CellLine, biolink:Food]\t[1, 2]\t2\n",
+            "quoted strings",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[CellLine, Food]\t['biolink:CellLine', 'Food']\t[1, 2]\t2\n",
+            "invalid biolink_types",
+        ),
+        (
+            DUPLICATE_REPORT_HEADER
+            + "EX:1\t[CellLine, Food]\t['biolink:CellLine', 'biolink:Food']\t[0, 2]\t2\n",
+            "positive integers",
+        ),
+    ],
+)
+def test_duplicate_report_rejects_malformed_or_ambiguous_rows(
+    nodenorm_modules, tmp_path, report_text, message
+):
+    write_release_files(nodenorm_modules, tmp_path)
+    (tmp_path / nodenorm_modules.release.DUPLICATE_CLIQUE_LEADERS_FILENAME).write_text(
+        report_text, encoding="utf-8"
+    )
+
+    with pytest.raises(
+        nodenorm_modules.release.NodeNormReleaseError, match=message
+    ) as exc:
+        nodenorm_modules.release.read_duplicate_clique_leaders(tmp_path)
+
+    assert "rerun the NodeNorm dump" in str(exc.value)
+
+
+def test_local_artifact_validation_requires_duplicate_report(
+    nodenorm_modules, tmp_path
+):
+    write_release_files(nodenorm_modules, tmp_path)
+    (tmp_path / nodenorm_modules.release.DUPLICATE_CLIQUE_LEADERS_FILENAME).unlink()
+
+    with pytest.raises(
+        nodenorm_modules.release.NodeNormReleaseError,
+        match="duplicate clique leader report.*rerun the NodeNorm dump",
+    ):
+        nodenorm_modules.release.local_compendium_paths(tmp_path)
+
+
+@pytest.mark.parametrize("manifest_change", [{"schema_version": 1}, {"reports": []}])
+def test_old_or_incomplete_manifest_is_rejected(
+    nodenorm_modules, tmp_path, manifest_change
+):
+    write_release_files(nodenorm_modules, tmp_path)
+    path = tmp_path / nodenorm_modules.release.RELEASE_MANIFEST_FILENAME
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.update(manifest_change)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(nodenorm_modules.release.NodeNormReleaseError, match="rerun"):
+        nodenorm_modules.release.read_release_manifest(tmp_path)
+
+
+def test_manifest_records_release_bound_report(nodenorm_modules, tmp_path):
+    write_release_files(nodenorm_modules, tmp_path, release="2026jul22")
+    payload = json.loads(
+        (tmp_path / nodenorm_modules.release.RELEASE_MANIFEST_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert payload["schema_version"] == 2
+    assert payload["release"] == "2026jul22"
+    assert payload["reports"] == ["reports/duckdb/duplicate_clique_leaders.tsv"]
+
+
+@pytest.mark.parametrize("report_text", [None, "not a valid report"])
+def test_current_release_with_bad_report_is_redownloaded(
+    nodenorm_modules, tmp_path, report_text
+):
+    dumper = make_dumper(
+        nodenorm_modules,
+        tmp_path,
+        FakeResponse("Babel 2025sep1\n"),
+        current_release="2025sep1",
+    )
+    folder = Path(dumper.current_data_folder)
+    write_release_files(nodenorm_modules, folder)
+    report = folder / nodenorm_modules.release.DUPLICATE_CLIQUE_LEADERS_FILENAME
+    if report_text is None:
+        report.unlink()
+    else:
+        report.write_text(report_text, encoding="utf-8")
+
+    dumper.create_todump_list()
+
+    assert any(
+        item["remote"].endswith("/2025sep1/reports/duckdb/duplicate_clique_leaders.tsv")
+        for item in dumper.to_dump
+    )
+
+
+def test_post_dump_does_not_promote_invalid_duplicate_report(
+    nodenorm_modules, tmp_path
+):
+    dumper = make_dumper(
+        nodenorm_modules,
+        tmp_path,
+        FakeResponse("Babel 2025sep1\n"),
+        current_release="2025sep1",
+    )
+    folder = Path(dumper.new_data_folder)
+    write_release_files(nodenorm_modules, folder)
+    (folder / nodenorm_modules.release.DUPLICATE_CLIQUE_LEADERS_FILENAME).write_text(
+        "bad report", encoding="utf-8"
+    )
+    generated_for = []
+    dumper._generate_conflation_database = generated_for.append
+
+    with pytest.raises(
+        nodenorm_modules.dumper.DumperException, match="duplicate clique leader report"
+    ):
+        dumper.post_dump()
+
+    assert generated_for == []
+    assert not getattr(dumper, "base_post_dump_called", False)

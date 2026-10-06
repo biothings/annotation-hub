@@ -1,5 +1,7 @@
 """Helpers for validating RENCI Babel releases and their artifact inventory."""
 
+import ast
+import csv
 import json
 import os
 import re
@@ -22,7 +24,16 @@ _RELEASE_PATTERN = re.compile(
 _VERSION_LINE_PATTERN = re.compile(r"Babel\s+(?P<release>\S+)")
 _ARTIFACT_FILENAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.txt")
 RELEASE_MANIFEST_FILENAME = "release-manifest.json"
-RELEASE_MANIFEST_SCHEMA_VERSION = 1
+RELEASE_MANIFEST_SCHEMA_VERSION = 2
+DUPLICATE_CLIQUE_LEADERS_FILENAME = "duplicate_clique_leaders.tsv"
+DUPLICATE_CLIQUE_LEADERS_RELATIVE_PATH = (
+    f"reports/duckdb/{DUPLICATE_CLIQUE_LEADERS_FILENAME}"
+)
+_DUPLICATE_REPORT_COLUMNS = (
+    "clique_leader",
+    "filenames",
+    "clique_leader_count",
+)
 _MONTH_NUMBERS = {
     "jan": 1,
     "feb": 2,
@@ -60,6 +71,7 @@ class NodeNormReleaseManifest:
     release: str
     compendia: tuple[str, ...]
     conflations: tuple[str, ...]
+    reports: tuple[str, ...] = (DUPLICATE_CLIQUE_LEADERS_RELATIVE_PATH,)
 
 
 def release_date(release: str) -> date:
@@ -175,13 +187,25 @@ def make_release_manifest(
     release: str,
     compendia: Iterable[str],
     conflations: Iterable[str],
+    reports: Iterable[str] = (DUPLICATE_CLIQUE_LEADERS_RELATIVE_PATH,),
 ) -> NodeNormReleaseManifest:
     """Validate and construct a release manifest."""
 
+    if not isinstance(reports, Iterable) or isinstance(reports, (str, bytes, Mapping)):
+        raise NodeNormReleaseError(
+            "NodeNorm manifest reports must be a list; rerun the NodeNorm dump"
+        )
+    reports = tuple(reports)
+    if reports != (DUPLICATE_CLIQUE_LEADERS_RELATIVE_PATH,):
+        raise NodeNormReleaseError(
+            "NodeNorm manifest must declare the release's duplicate clique leader "
+            "report; rerun the NodeNorm dump"
+        )
     manifest = NodeNormReleaseManifest(
         release=validate_release(release),
         compendia=_validate_artifact_filenames(compendia, kind="compendium"),
         conflations=_validate_artifact_filenames(conflations, kind="conflation"),
+        reports=tuple(reports),
     )
     compendia_by_normalized_name = {
         filename.casefold(): filename for filename in manifest.compendia
@@ -204,7 +228,7 @@ def write_release_manifest(
     """Atomically persist the exact upstream inventory used by the dumper."""
 
     validated = make_release_manifest(
-        manifest.release, manifest.compendia, manifest.conflations
+        manifest.release, manifest.compendia, manifest.conflations, manifest.reports
     )
     folder = Path(data_folder)
     folder.mkdir(parents=True, exist_ok=True)
@@ -215,6 +239,7 @@ def write_release_manifest(
         "release": validated.release,
         "compendia": list(validated.compendia),
         "conflations": list(validated.conflations),
+        "reports": list(validated.reports),
     }
     try:
         with temporary_path.open("w", encoding="utf-8") as manifest_handle:
@@ -246,13 +271,139 @@ def read_release_manifest(data_folder: str | Path) -> NodeNormReleaseManifest:
     if payload.get("schema_version") != RELEASE_MANIFEST_SCHEMA_VERSION:
         raise NodeNormReleaseError(
             "Unsupported NodeNorm release manifest schema version "
-            f"{payload.get('schema_version')!r}"
+            f"{payload.get('schema_version')!r}; rerun the NodeNorm dump"
         )
     return make_release_manifest(
         payload.get("release"),
         payload.get("compendia", ()),
         payload.get("conflations", ()),
+        payload.get("reports", ()),
     )
+
+
+def _report_list(value: str, column: str, *, quoted: bool = False) -> list[str]:
+    """Read DuckDB lists (Babel quotes Biolink CURIEs, but not filenames)."""
+
+    if (
+        not isinstance(value, str)
+        or not value.startswith("[")
+        or not value.endswith("]")
+    ):
+        raise NodeNormReleaseError(f"{column} must be a bracketed list")
+    if quoted:
+        try:
+            items = ast.literal_eval(value)
+        except (ValueError, SyntaxError) as exc:
+            raise NodeNormReleaseError(f"{column} must contain quoted strings") from exc
+        if not isinstance(items, list) or any(
+            not isinstance(item, str) for item in items
+        ):
+            raise NodeNormReleaseError(f"{column} must contain quoted strings")
+        return items
+    items = [item.strip() for item in value[1:-1].split(",")]
+    if any(not item or any(char in item for char in "[]\"'") for item in items):
+        raise NodeNormReleaseError(f"{column} contains an invalid list item")
+    return items
+
+
+def read_duplicate_clique_leaders(
+    data_folder: str | Path,
+) -> dict[str, tuple[str, ...]]:
+    """Return reported collision sources in manifest order (the first wins).
+
+    Each reported source must identify one distinct compendium. A repeated source
+    is ambiguous because the report cannot select between two rows in one file.
+    Header-only reports are valid for releases with no duplicate leaders.
+    """
+
+    folder = Path(data_folder)
+    manifest = read_release_manifest(folder)
+    report_path = folder / DUPLICATE_CLIQUE_LEADERS_FILENAME
+    by_stem = {Path(filename).stem: filename for filename in manifest.compendia}
+    collisions = {}
+    try:
+        with report_path.open(encoding="utf-8", newline="") as report_handle:
+            rows = csv.DictReader(report_handle, delimiter="\t", strict=True)
+            if (
+                rows.fieldnames is None
+                or len(rows.fieldnames) != len(set(rows.fieldnames))
+                or not set(_DUPLICATE_REPORT_COLUMNS).issubset(rows.fieldnames)
+            ):
+                raise NodeNormReleaseError(
+                    "missing or repeated required columns: "
+                    + ", ".join(_DUPLICATE_REPORT_COLUMNS)
+                )
+            for row in rows:
+                try:
+                    if None in row or any(value is None for value in row.values()):
+                        raise NodeNormReleaseError("row does not match its header")
+                    leader = row["clique_leader"]
+                    prefix, _, local_id = leader.partition(":")
+                    if not prefix or not local_id or leader != leader.strip():
+                        raise NodeNormReleaseError("clique_leader must be a CURIE")
+                    if leader in collisions:
+                        raise NodeNormReleaseError(f"repeated clique_leader {leader!r}")
+                    filenames = _report_list(row["filenames"], "filenames")
+                    # Older Babel reports omit this metadata. Validate it when
+                    # available, but source selection only requires filenames.
+                    types = (
+                        _report_list(row["biolink_types"], "biolink_types", quoted=True)
+                        if "biolink_types" in row
+                        else None
+                    )
+                    counts = (
+                        _report_list(
+                            row["clique_identifier_counts"], "clique_identifier_counts"
+                        )
+                        if "clique_identifier_counts" in row
+                        else None
+                    )
+                    count = row["clique_leader_count"]
+                    if not count.isascii() or not count.isdigit() or int(count) < 2:
+                        raise NodeNormReleaseError(
+                            "clique_leader_count must be at least 2"
+                        )
+                    if not all(
+                        len(values) == int(count)
+                        for values in (filenames, types, counts)
+                        if values is not None
+                    ):
+                        raise NodeNormReleaseError(
+                            "list lengths do not match clique_leader_count"
+                        )
+                    if len(set(filenames)) != len(filenames):
+                        raise NodeNormReleaseError("repeated compendium is ambiguous")
+                    unknown = set(filenames) - set(by_stem)
+                    if unknown:
+                        raise NodeNormReleaseError(
+                            "unknown compendium: " + ", ".join(sorted(unknown))
+                        )
+                    if types is not None and any(
+                        not re.fullmatch(r"biolink:[A-Za-z][A-Za-z0-9_]*", value)
+                        for value in types
+                    ):
+                        raise NodeNormReleaseError("invalid biolink_types entry")
+                    if counts is not None and any(
+                        not value.isascii() or not value.isdigit() or int(value) < 1
+                        for value in counts
+                    ):
+                        raise NodeNormReleaseError(
+                            "clique_identifier_counts must be positive integers"
+                        )
+                    allowed = {by_stem[filename] for filename in filenames}
+                    collisions[leader] = tuple(
+                        filename
+                        for filename in manifest.compendia
+                        if filename in allowed
+                    )
+                except NodeNormReleaseError as exc:
+                    raise NodeNormReleaseError(f"line {rows.line_num}: {exc}") from exc
+    except (OSError, UnicodeError, csv.Error, NodeNormReleaseError) as exc:
+        raise NodeNormReleaseError(
+            f"Invalid NodeNorm duplicate clique leader report {report_path}: {exc}; "
+            "rerun the NodeNorm dump"
+        ) from exc
+    return collisions
 
 
 def local_compendium_paths(data_folder: str | Path) -> tuple[Path, ...]:
@@ -286,4 +437,5 @@ def local_compendium_paths(data_folder: str | Path) -> tuple[Path, ...]:
         raise NodeNormReleaseError(
             "Downloaded NodeNorm artifacts are empty: " + ", ".join(sorted(empty))
         )
+    read_duplicate_clique_leaders(folder)
     return tuple(folder / filename for filename in manifest.compendia)

@@ -23,11 +23,6 @@ def worker_module(monkeypatch, tmp_path):
     biothings_module.config = config
 
     utils_module = types.ModuleType("biothings.utils")
-    dataload_module = types.ModuleType("biothings.utils.dataload")
-    dataload_module.merge_struct = lambda incoming, existing: {
-        **incoming,
-        **existing,
-    }
     serializer_module = types.ModuleType("biothings.utils.serializer")
     serializer_module.json_loads = json.loads
     hub_db_module = types.ModuleType("biothings.utils.hub_db")
@@ -83,7 +78,6 @@ def worker_module(monkeypatch, tmp_path):
 
     monkeypatch.setitem(sys.modules, "biothings", biothings_module)
     monkeypatch.setitem(sys.modules, "biothings.utils", utils_module)
-    monkeypatch.setitem(sys.modules, "biothings.utils.dataload", dataload_module)
     monkeypatch.setitem(sys.modules, "biothings.utils.serializer", serializer_module)
     monkeypatch.setitem(sys.modules, "biothings.utils.hub_db", hub_db_module)
     monkeypatch.setitem(sys.modules, "biothings.utils.common", common_module)
@@ -117,13 +111,19 @@ def write_worker_release(data_folder, compendia):
     conflations = ("DrugChemical.txt", "GeneProtein.txt")
     for filename in (*compendia, *conflations):
         (data_folder / filename).write_text("{}\n", encoding="utf-8")
+    (data_folder / "duplicate_clique_leaders.tsv").write_text(
+        "clique_leader\tfilenames\tbiolink_types\tclique_identifier_counts"
+        "\tclique_leader_count\n",
+        encoding="utf-8",
+    )
     (data_folder / "release-manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "release": "2026jul22",
                 "compendia": list(compendia),
                 "conflations": list(conflations),
+                "reports": ["reports/duckdb/duplicate_clique_leaders.tsv"],
             }
         ),
         encoding="utf-8",
@@ -197,6 +197,24 @@ def test_offset_tasks_fail_before_analysis_when_manifest_file_is_missing(
         list(worker_module._build_offset_tasks(tmp_path, "collection"))
 
     assert analyzed == []
+
+
+def test_missing_duplicate_report_fails_before_upload_work(
+    worker_module, monkeypatch, tmp_path
+):
+    write_worker_release(tmp_path, ("Food.txt", "CellLine.txt"))
+    (tmp_path / "duplicate_clique_leaders.tsv").unlink()
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "_configure_sqlite_tmpdir",
+        lambda: calls.append("configure-sqlite"),
+    )
+
+    with pytest.raises(ValueError, match="duplicate_clique_leaders.tsv"):
+        worker_module.upload_process(tmp_path, "collection")
+
+    assert calls == []
 
 
 class FakeBulkWriteResult:
@@ -374,6 +392,500 @@ def identifier_document(document_id, *curies, node_type="biolink:Disease", label
         "type": node_type,
         "identifiers": [{"i": curie, "l": labels.get(curie, "")} for curie in curies],
     }
+
+
+class FakeMongoInsertCollection(FakeMongoCollection):
+    """Apply unordered inserts, including MongoDB's partial-write behavior."""
+
+    def __init__(self, worker_module):
+        super().__init__()
+        self.error_type = worker_module.pymongo.errors.BulkWriteError
+        self.insert_calls = []
+        self.last_error = None
+
+    def insert_many(self, documents, ordered):
+        assert ordered is False
+        self.insert_calls.append(copy.deepcopy(documents))
+        errors = []
+        for index, document in enumerate(documents):
+            if self.stored(document["_id"]) is None:
+                self.documents.append(copy.deepcopy(document))
+            else:
+                errors.append(
+                    {
+                        "index": index,
+                        "code": 11000,
+                        "keyPattern": {"_id": 1},
+                        "keyValue": {"_id": document["_id"]},
+                        "op": copy.deepcopy(document),
+                    }
+                )
+        if errors:
+            self.last_error = self.error_type(
+                {"writeErrors": errors, "writeConcernErrors": []}
+            )
+            raise self.last_error
+
+
+def install_insert_collection(worker_module, monkeypatch):
+    collection = FakeMongoInsertCollection(worker_module)
+    monkeypatch.setattr(
+        worker_module.pymongo.collection,
+        "Collection",
+        lambda database, name: collection,
+    )
+    queued_identifiers = []
+    monkeypatch.setattr(
+        worker_module,
+        "_queue_identifier_batch",
+        lambda identifiers: queued_identifiers.extend(identifiers),
+    )
+    return collection, queued_identifiers
+
+
+def source_clique(*curies, node_type="biolink:Disease", label="source label"):
+    return {
+        "type": node_type,
+        "ic": "7.25",
+        "preferred_name": label,
+        "identifiers": [{"i": curie, "l": label} for curie in curies],
+        "taxa": ["NCBITaxon:9606"],
+    }
+
+
+def upload_source_cliques(
+    worker_module,
+    tmp_path,
+    filename,
+    documents,
+    duplicate_clique_leaders=None,
+    **kwargs,
+):
+    input_file = tmp_path / filename
+    input_file.write_text(
+        "".join(json.dumps(document) + "\n" for document in documents),
+        encoding="utf-8",
+    )
+    return worker_module.subset_upload_worker(
+        input_file=input_file,
+        buffer_size=2,
+        offset_start=0,
+        offset_end=input_file.stat().st_size,
+        collection_name="collection",
+        duplicate_clique_leaders=duplicate_clique_leaders or {},
+        **kwargs,
+    )
+
+
+def enriched_source_clique(document):
+    expected = copy.deepcopy(document)
+    expected["_id"] = expected["identifiers"][0]["i"]
+    expected["ic"] = float(expected["ic"])
+    for identifier in expected["identifiers"]:
+        identifier["c"] = {"gp": None, "dc": None}
+    return expected
+
+
+@pytest.mark.parametrize(
+    "load_order",
+    [
+        *itertools.permutations(("AnatomicalEntity.txt", "ChemicalEntity.txt")),
+        *itertools.permutations(
+            ("AnatomicalEntity.txt", "ChemicalEntity.txt", "Protein.txt")
+        ),
+    ],
+)
+def test_duplicate_leaders_retain_one_whole_source_in_every_load_order(
+    worker_module, monkeypatch, tmp_path, load_order
+):
+    """A smaller winner is intentional: clique size is not biological authority."""
+    candidates = {
+        "AnatomicalEntity.txt": source_clique(
+            "MESH:leader", node_type="biolink:AnatomicalEntity", label="anatomy"
+        ),
+        "ChemicalEntity.txt": source_clique(
+            "MESH:leader",
+            "CHEBI:other",
+            node_type="biolink:ChemicalEntity",
+            label="chemical",
+        ),
+        "Protein.txt": source_clique(
+            "MESH:leader",
+            "UniProtKB:other",
+            "NCBIGene:other",
+            node_type="biolink:Protein",
+            label="protein",
+        ),
+    }
+    collection, queued_identifiers = install_insert_collection(
+        worker_module, monkeypatch
+    )
+    declared_sources = tuple(sorted(load_order))
+    report = {"MESH:leader": declared_sources}
+
+    results = [
+        upload_source_cliques(
+            worker_module, tmp_path, filename, [candidates[filename]], report
+        )
+        for filename in load_order
+    ]
+
+    assert collection.documents == [
+        enriched_source_clique(candidates[declared_sources[0]])
+    ]
+    assert sum(result.identifier_count for result in results) == 1
+    assert [result.duplicate_leader_counts for result in results] == [
+        {("MESH:leader", filename): 1} for filename in load_order
+    ]
+    assert queued_identifiers == ["MESH:leader"]
+    assert len(collection.insert_calls) == 1
+    assert collection.bulk_write_calls == []
+
+
+def test_duplicate_leaders_with_same_type_do_not_merge_aliases_or_metadata(
+    worker_module, monkeypatch, tmp_path
+):
+    collection, queued_identifiers = install_insert_collection(
+        worker_module, monkeypatch
+    )
+    winner = source_clique("EX:leader", "EX:kept", label="winner")
+    loser = source_clique("EX:leader", "EX:discarded", label="loser")
+    loser["taxa"] = ["NCBITaxon:10090"]
+    report = {"EX:leader": ("A.txt", "B.txt")}
+
+    assert (
+        upload_source_cliques(
+            worker_module, tmp_path, "B.txt", [loser], report
+        ).identifier_count
+        == 0
+    )
+    assert (
+        upload_source_cliques(
+            worker_module, tmp_path, "A.txt", [winner], report
+        ).identifier_count
+        == 2
+    )
+
+    assert collection.documents == [enriched_source_clique(winner)]
+    assert queued_identifiers == ["EX:leader", "EX:kept"]
+
+
+def test_discarded_identifiers_never_reach_accounting_or_conflation(
+    worker_module, monkeypatch, tmp_path
+):
+    collection, queued_identifiers = install_insert_collection(
+        worker_module, monkeypatch
+    )
+    monkeypatch.setattr(worker_module, "NODENORM_IDENTIFIER_BATCH_SIZE", 1)
+    conflated_leaders = []
+
+    def record_conflations(buffer, leaders, _connection):
+        conflated_leaders.extend(leaders)
+        return buffer
+
+    monkeypatch.setattr(
+        worker_module, "_update_buffer_with_conflations", record_conflations
+    )
+    report = {"EX:leader": ("A.txt", "B.txt", "C.txt")}
+    retained_count = 0
+    for filename, document in (
+        ("B.txt", source_clique("EX:leader", "EX:discarded")),
+        ("A.txt", source_clique("EX:leader")),
+        ("C.txt", source_clique("EX:leader", "EX:discarded")),
+    ):
+        retained_count += upload_source_cliques(
+            worker_module,
+            tmp_path,
+            filename,
+            [document],
+            report,
+            conflation_database=":memory:",
+        ).identifier_count
+
+    assert retained_count == 1
+    assert queued_identifiers == ["EX:leader"]
+    assert conflated_leaders == ["EX:leader"]
+    assert collection.curies("EX:leader") == ["EX:leader"]
+
+
+@pytest.mark.parametrize(
+    "invalid_type",
+    [None, "", "   ", [], ["biolink:Protein"], 42, {}],
+)
+@pytest.mark.parametrize("filename", ["A.txt", "B.txt"])
+def test_invalid_source_types_fail_before_accounting_even_for_losing_cliques(
+    worker_module, monkeypatch, tmp_path, invalid_type, filename
+):
+    collection, queued_identifiers = install_insert_collection(
+        worker_module, monkeypatch
+    )
+    monkeypatch.setattr(worker_module, "NODENORM_IDENTIFIER_BATCH_SIZE", 1)
+
+    with pytest.raises(ValueError, match="type"):
+        upload_source_cliques(
+            worker_module,
+            tmp_path,
+            filename,
+            [source_clique("EX:leader", node_type=invalid_type)],
+            {"EX:leader": ("A.txt", "B.txt")},
+        )
+
+    assert queued_identifiers == []
+    assert collection.documents == []
+    assert collection.insert_calls == []
+
+
+def test_missing_source_type_fails_before_accounting(
+    worker_module, monkeypatch, tmp_path
+):
+    collection, queued_identifiers = install_insert_collection(
+        worker_module, monkeypatch
+    )
+    document = source_clique("EX:leader")
+    del document["type"]
+
+    with pytest.raises(ValueError, match="type"):
+        upload_source_cliques(worker_module, tmp_path, "A.txt", [document])
+
+    assert queued_identifiers == []
+    assert collection.documents == []
+
+
+def test_reported_leader_in_undeclared_source_fails_before_accounting(
+    worker_module, monkeypatch, tmp_path
+):
+    collection, queued_identifiers = install_insert_collection(
+        worker_module, monkeypatch
+    )
+
+    with pytest.raises(ValueError, match="EX:leader"):
+        upload_source_cliques(
+            worker_module,
+            tmp_path,
+            "Unexpected.txt",
+            [source_clique("EX:leader")],
+            {"EX:leader": ("A.txt", "B.txt")},
+        )
+
+    assert queued_identifiers == []
+    assert collection.documents == []
+
+
+def test_duplicate_report_reconciliation_accepts_exact_source_observations(
+    worker_module,
+):
+    worker_module._validate_duplicate_leader_counts(
+        {"EX:leader": ("A.txt", "B.txt")},
+        {("EX:leader", "A.txt"): 1, ("EX:leader", "B.txt"): 1},
+    )
+    worker_module._validate_duplicate_leader_counts({}, {})
+
+
+@pytest.mark.parametrize(
+    "observations",
+    [
+        pytest.param({("EX:leader", "B.txt"): 1}, id="winner-missing"),
+        pytest.param({("EX:leader", "A.txt"): 1}, id="loser-missing"),
+        pytest.param(
+            {("EX:leader", "A.txt"): 1, ("EX:leader", "B.txt"): 2},
+            id="loser-repeated",
+        ),
+    ],
+)
+def test_duplicate_report_reconciliation_blocks_missing_or_repeated_sources(
+    worker_module, observations
+):
+    with pytest.raises(
+        worker_module.NodeNormCollectionValidationError, match="EX:leader"
+    ):
+        worker_module._validate_duplicate_leader_counts(
+            {"EX:leader": ("A.txt", "B.txt")}, observations
+        )
+
+
+def test_repeated_discarded_clique_is_observed_and_blocks_promotion(
+    worker_module, monkeypatch, tmp_path
+):
+    collection, queued_identifiers = install_insert_collection(
+        worker_module, monkeypatch
+    )
+    report = {"EX:leader": ("A.txt", "B.txt")}
+    result = upload_source_cliques(
+        worker_module,
+        tmp_path,
+        "B.txt",
+        [source_clique("EX:leader"), source_clique("EX:leader", "EX:other")],
+        report,
+    )
+
+    assert result.identifier_count == 0
+    assert result.duplicate_leader_counts == {("EX:leader", "B.txt"): 2}
+    assert queued_identifiers == []
+    assert collection.insert_calls == []
+    with pytest.raises(worker_module.NodeNormCollectionValidationError):
+        worker_module._validate_duplicate_leader_counts(
+            report, {("EX:leader", "A.txt"): 1, **result.duplicate_leader_counts}
+        )
+
+
+@pytest.mark.parametrize("complete_report", [False, True])
+def test_upload_reconciles_duplicate_report_before_promotion_even_with_audit_off(
+    worker_module, monkeypatch, complete_report
+):
+    report = {"EX:leader": ("A.txt", "B.txt")}
+    observed = {("EX:leader", "A.txt"): 1}
+    if complete_report:
+        observed[("EX:leader", "B.txt")] = 1
+
+    class FakeFuture:
+        def result(self):
+            return worker_module.UploadPartitionResult(1, observed)
+
+        def cancel(self):
+            return False
+
+    class FakeExecutor:
+        def __init__(self, **kwargs):
+            assert kwargs["initargs"][2] == report
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, *_args, **_kwargs):
+            return FakeFuture()
+
+    monkeypatch.setattr(
+        worker_module.config, "NODENORM_CURIE_VALIDATION_MODE", "off", raising=False
+    )
+    monkeypatch.setattr(worker_module, "_configure_sqlite_tmpdir", lambda: None)
+    monkeypatch.setattr(worker_module, "create_identifiers_table", lambda _data: None)
+    monkeypatch.setattr(worker_module, "NODENORM_IDENTIFIER_SHARD_COUNT", 0)
+    monkeypatch.setattr(worker_module, "_identifier_database_paths", lambda _data: ())
+    monkeypatch.setattr(
+        worker_module.multiprocessing,
+        "get_context",
+        lambda _kind: types.SimpleNamespace(Event=threading.Event),
+    )
+    monkeypatch.setattr(
+        worker_module.concurrent.futures, "ProcessPoolExecutor", FakeExecutor
+    )
+    monkeypatch.setattr(
+        worker_module.concurrent.futures,
+        "as_completed",
+        lambda futures: iter(tuple(futures)),
+    )
+    monkeypatch.setattr(
+        worker_module, "local_compendium_paths", lambda _data: (Path("A.txt"),)
+    )
+    monkeypatch.setattr(
+        worker_module, "read_duplicate_clique_leaders", lambda _data: report
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_offset_tasks",
+        lambda *_args, **_kwargs: iter(({},)),
+    )
+    promotion_calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "_prepare_collection_for_promotion",
+        lambda *args, **kwargs: promotion_calls.append((args, kwargs)),
+    )
+
+    if complete_report:
+        assert worker_module.upload_process("data", "collection") == 1
+        assert promotion_calls == [(("data", "collection"), {"validation_mode": "off"})]
+    else:
+        with pytest.raises(worker_module.NodeNormCollectionValidationError):
+            worker_module.upload_process("data", "collection")
+        assert promotion_calls == []
+
+
+@pytest.mark.parametrize("declared", [False, True])
+def test_repeated_leader_inside_one_source_always_fails(
+    worker_module, monkeypatch, tmp_path, declared
+):
+    collection, _ = install_insert_collection(worker_module, monkeypatch)
+    report = {"EX:leader": ("A.txt", "B.txt")} if declared else {}
+    first = source_clique("EX:leader", label="first")
+    second = source_clique("EX:leader", "EX:other", label="second")
+
+    with pytest.raises(worker_module.pymongo.errors.BulkWriteError) as raised:
+        upload_source_cliques(worker_module, tmp_path, "A.txt", [first, second], report)
+
+    assert raised.value is collection.last_error
+    assert collection.documents == [enriched_source_clique(first)]
+    assert collection.bulk_write_calls == []
+
+
+def test_unlisted_cross_source_leader_collision_fails_without_modifying_winner(
+    worker_module, monkeypatch, tmp_path
+):
+    collection, _ = install_insert_collection(worker_module, monkeypatch)
+    first = source_clique("EX:leader", node_type="biolink:Protein")
+    upload_source_cliques(worker_module, tmp_path, "A.txt", [first], {})
+
+    with pytest.raises(worker_module.pymongo.errors.BulkWriteError) as raised:
+        upload_source_cliques(
+            worker_module,
+            tmp_path,
+            "B.txt",
+            [source_clique("EX:leader", "EX:other")],
+            {},
+        )
+
+    assert raised.value is collection.last_error
+    assert collection.documents == [enriched_source_clique(first)]
+    assert collection.bulk_write_calls == []
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        pytest.param(
+            {"writeErrors": [{"code": 11000, "keyPattern": {"_id": 1}}]},
+            id="unexpected-id-duplicate",
+        ),
+        pytest.param(
+            {"writeErrors": [{"code": 11000, "keyPattern": {"other_unique": 1}}]},
+            id="other-unique-index",
+        ),
+        pytest.param(
+            {"writeErrors": [{"code": 11000}, {"code": 121}]},
+            id="duplicate-and-document-validation",
+        ),
+        pytest.param(
+            {"writeErrors": [], "writeConcernErrors": [{"code": 64}]},
+            id="write-concern-only",
+        ),
+        pytest.param(
+            {"writeErrors": [{"code": 11000}], "writeConcernErrors": [{"code": 64}]},
+            id="duplicate-and-write-concern",
+        ),
+    ],
+)
+def test_upload_propagates_every_bulk_write_error_unchanged(
+    worker_module, tmp_path, details
+):
+    error = worker_module.pymongo.errors.BulkWriteError(copy.deepcopy(details))
+
+    def fail_insert(_documents, ordered):
+        assert ordered is False
+        raise error
+
+    collection = types.SimpleNamespace(insert_many=fail_insert)
+    document = enriched_source_clique(source_clique("EX:leader"))
+    original = copy.deepcopy(document)
+
+    with pytest.raises(worker_module.pymongo.errors.BulkWriteError) as raised:
+        worker_module._upload_buffer(collection, [document], tmp_path / "A.txt", 1)
+
+    assert raised.value is error
+    assert document == original
+    assert error.details == details
 
 
 class FakeIdentifierConnection:
@@ -894,6 +1406,9 @@ def test_upload_raises_original_identifier_writer_error(worker_module, monkeypat
         worker_module,
         "local_compendium_paths",
         lambda _data_folder: (Path("input.txt"),),
+    )
+    monkeypatch.setattr(
+        worker_module, "read_duplicate_clique_leaders", lambda _data_folder: {}
     )
 
     post_upload_calls = []
