@@ -122,6 +122,14 @@ newer, and symlinked folders are left alone. Cleanup failures generate a warning
 instead of failing a valid download. This file-retention setting is independent
 of the uploader's MongoDB collection retention.
 
+Retention configuration is validated before discovery or download begins, so an
+invalid setting cannot cause repeated large downloads. Older dated folders that
+cannot be validated are retained and listed in a Hub warning notification for
+manual cleanup. This includes the legacy `2026jun30` snapshot, which did not have
+a completion report, and superseded partial downloads. Inspect these folders and
+remove them manually only after confirming their files are no longer needed;
+they do not count toward the validated-snapshot retention limit.
+
 Downloads and uploads are each capped at four concurrent shards. Dumps are not
 scheduled automatically because each full snapshot is very large; an operator
 must trigger the release check. Abstracts are retained in Elasticsearch

@@ -777,6 +777,47 @@ def test_archive_cleanup_failure_does_not_fail_valid_post_dump(
     assert any("Unable to remove" in r.message and r.notify for r in caplog.records)
 
 
+def test_archive_cleanup_warns_about_legacy_and_partial_folders(dumper_module, caplog):
+    dumper = dumper_module.PubMedMetadataDumper()
+    dumper.release = "2026sep26"
+    dumper.src_doc["download"]["last_successful_release"] = "2026aug21"
+    root = Path(dumper.src_root_folder)
+    for name in ("2026aug5", "2026aug21", "2026sep26"):
+        write_local_release(root / name)
+    legacy = root / "2026jun30"
+    legacy.mkdir()
+    for index in range(16):
+        (legacy / f"pubmed_metadata_{index:05d}.ndjson.gz").touch()
+    partial_folder = root / "2026aug20"
+    partial_folder.mkdir()
+    (partial_folder / "pubmed_metadata_0.ndjson.gz").touch()
+
+    with caplog.at_level(logging.WARNING):
+        dumper.post_dump()
+
+    warnings = [r for r in caplog.records if "unvalidated older PubMed" in r.message]
+    assert len(warnings) == 1
+    assert warnings[0].notify is True
+    assert str(legacy) in warnings[0].message
+    assert str(partial_folder) in warnings[0].message
+    assert legacy.exists() and partial_folder.exists()
+    assert (root / "2026aug21").exists()
+    assert not (root / "2026aug5").exists()
+
+
+@pytest.mark.parametrize("invalid_keep", [1, True, "2"])
+def test_invalid_archive_retention_fails_before_discovery(dumper_module, invalid_keep):
+    dumper = dumper_module.PubMedMetadataDumper()
+    dumper.KEEP_ARCHIVED_RELEASES = invalid_keep
+    dumper.client = FakeClient(release_responses())
+
+    with pytest.raises(dumper_module.DumperException, match="must be at least 2"):
+        dumper.create_todump_list()
+
+    assert not dumper.to_dump
+    assert not dumper.client.calls
+
+
 @pytest.fixture
 def sdk_flow(dumper_module, monkeypatch):
     """Exercise the pinned SDK's actual lifecycle methods without a live Hub DB."""
@@ -921,6 +962,21 @@ def test_sdk_check_only_does_not_restore_status_or_start_transfer(sdk_flow):
     assert result == "Nothing to dump"
     assert dumper.src_doc == original
     assert not hasattr(dumper, "downloaded")
+    assert not pending
+
+
+def test_sdk_invalid_retention_never_starts_repeated_downloads(sdk_flow):
+    cls, manager, pending = sdk_flow
+    dumper = cls()
+    dumper.KEEP_ARCHIVED_RELEASES = 1
+    dumper.client = FakeClient(release_responses())
+    original = deepcopy(dumper.src_doc)
+    for _ in range(3):
+        with pytest.raises(Exception, match="must be at least 2"):
+            asyncio.run(dumper.dump(job_manager=manager))
+    assert not dumper.client.calls
+    assert not hasattr(dumper, "downloaded")
+    assert dumper.src_doc == original
     assert not pending
 
 

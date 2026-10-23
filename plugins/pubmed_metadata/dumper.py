@@ -209,6 +209,7 @@ class PubMedMetadataDumper(HTTPDumper):
         self.release = candidate
 
     async def dump(self, steps=None, force=False, job_manager=None, **kwargs):
+        self._archive_retention()
         # The SDK also forces retries internally. Preserve the operator's intent.
         self._explicit_force = force
         self._check_only = kwargs.get("check_only", False)
@@ -244,6 +245,7 @@ class PubMedMetadataDumper(HTTPDumper):
     def create_todump_list(self, force: bool = False) -> None:
         """Queue every file in a newer, fully validated release."""
 
+        self._archive_retention()
         self.to_dump = []
         self.release = None
         self.set_release()
@@ -302,16 +304,23 @@ class PubMedMetadataDumper(HTTPDumper):
         super().post_dump(*args, **kwargs)
         self._prune_archived_releases()
 
-    def _prune_archived_releases(self) -> None:
-        """Keep this validated snapshot and the configured rollback snapshots."""
-
+    def _archive_retention(self) -> int | None:
+        """Reject invalid retention settings before any transfer can start."""
         keep = self.KEEP_ARCHIVED_RELEASES
         if keep is None:
-            return
+            return None
         if isinstance(keep, bool) or not isinstance(keep, int) or keep < 2:
             raise DumperException(
                 "PUBMED_METADATA_KEEP_ARCHIVED_RELEASES must be at least 2 or None"
             )
+        return keep
+
+    def _prune_archived_releases(self) -> None:
+        """Keep this validated snapshot and the configured rollback snapshots."""
+
+        keep = self._archive_retention()
+        if keep is None:
+            return
         current = Path(self.new_data_folder)
         if (
             current.is_symlink()
@@ -336,17 +345,29 @@ class PubMedMetadataDumper(HTTPDumper):
                 "Unable to list PubMed archives: %s", exc, extra={"notify": True}
             )
             return
+        unvalidated = []
         for folder in folders:
             if folder.is_symlink() or not folder.is_dir() or folder == current:
                 continue
             try:
                 date = release_date(folder.name)
-                if date >= current_date:
-                    continue
-                local_shard_paths(folder)
             except PubMedReleaseError:
                 continue
+            if date >= current_date:
+                continue
+            try:
+                local_shard_paths(folder)
+            except PubMedReleaseError:
+                unvalidated.append(str(folder))
+                continue
             older.append((date, folder))
+        if unvalidated:
+            self.logger.warning(
+                "Retaining unvalidated older PubMed release folders; review for "
+                "manual cleanup: %s",
+                ", ".join(sorted(unvalidated)),
+                extra={"notify": True},
+            )
         last_successful = self.src_doc.get("download", {}).get(
             "last_successful_release"
         )
