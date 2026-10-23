@@ -20,6 +20,15 @@ PARSER_SPEC.loader.exec_module(parser)
 def upstream_record(**overrides):
     record = {
         "id": "PMID:12345678",
+        "identifiers": [
+            "PMID:12345678",
+            "doi:10.1000/Example",
+            "PMC:PMC1234567",
+        ],
+        "publication_types": [
+            {"id": "MESH:D016428", "name": "Journal Article"},
+            {"id": "MESH:D016454", "name": "Review"},
+        ],
         "journal_name": "Journal of Examples",
         "journal_abbrev": "J Ex",
         "article_title": "A useful example",
@@ -31,6 +40,15 @@ def upstream_record(**overrides):
         "abstract": "An abstract with Unicode: β.",
     }
     record.update(overrides)
+    if "id" in overrides and "identifiers" not in overrides:
+        record["identifiers"] = [record["id"]]
+    return record
+
+
+def legacy_record(**overrides):
+    record = upstream_record(**overrides)
+    del record["identifiers"]
+    del record["publication_types"]
     return record
 
 
@@ -45,6 +63,14 @@ def test_transform_namespaces_pubmed_metadata():
     assert document == {
         "_id": "PMID:12345678",
         "pubmed": {
+            "identifiers": [
+                "doi:10.1000/Example",
+                "PMC:PMC1234567",
+            ],
+            "publication_types": [
+                {"id": "MESH:D016428", "name": "Journal Article"},
+                {"id": "MESH:D016454", "name": "Review"},
+            ],
             "journal": {
                 "name": "Journal of Examples",
                 "abbr": "J Ex",
@@ -72,6 +98,171 @@ def test_streams_gzip_ndjson(tmp_path):
     assert documents[0]["pubmed"]["abstract"].endswith("β.")
 
 
+def test_legacy_schema_stores_an_empty_alternate_identifier_list():
+    document = parser.transform_pubmed_metadata_record(legacy_record())
+
+    assert document["pubmed"]["identifiers"] == []
+    assert "publication_types" not in document["pubmed"]
+    assert "pubdate_raw" not in document["pubmed"]
+
+
+def test_pre_publication_type_schema_keeps_the_field_absent():
+    record = upstream_record()
+    del record["publication_types"]
+
+    document = parser.transform_pubmed_metadata_record(record)
+
+    assert document["pubmed"]["identifiers"] == [
+        "doi:10.1000/Example",
+        "PMC:PMC1234567",
+    ]
+    assert "publication_types" not in document["pubmed"]
+
+
+def test_preserves_empty_publication_type_list():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(publication_types=[])
+    )
+
+    assert document["pubmed"]["publication_types"] == []
+
+
+def test_preserves_publication_type_order_and_blank_names():
+    publication_types = [
+        {"id": "MESH:D002363", "name": "Case Reports"},
+        {"id": "MESH:D016428", "name": ""},
+        {"id": "MESH:D016454", "name": "Review"},
+    ]
+
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(publication_types=publication_types)
+    )
+
+    assert document["pubmed"]["publication_types"] == publication_types
+
+
+def test_normalizes_well_formed_pmcid_aliases_preserving_order():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=[
+                "PMID:12345678",
+                "PMCID:PMC7654321",
+                "doi:10.1000/Example",
+            ]
+        )
+    )
+
+    assert document["pubmed"]["identifiers"] == [
+        "PMC:PMC7654321",
+        "doi:10.1000/Example",
+    ]
+
+
+def test_preserves_malformed_pmcid_aliases():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=["PMID:12345678", "PMCID:wh_2021_113"]
+        )
+    )
+
+    assert document["pubmed"]["identifiers"] == [
+        "PMCID:wh_2021_113",
+    ]
+
+
+def test_deduplicates_canonical_pmc_and_pmcid_alias_only():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=[
+                "PMID:12345678",
+                "PMC:PMC7654321",
+                "PMCID:PMC7654321",
+                "doi:10.1000/Example",
+                "doi:10.1000/Example",
+            ]
+        )
+    )
+
+    assert document["pubmed"]["identifiers"] == [
+        "PMC:PMC7654321",
+        "doi:10.1000/Example",
+        "doi:10.1000/Example",
+    ]
+
+
+def test_alias_collision_keeps_the_first_identifier_position():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=[
+                "PMID:12345678",
+                "PMCID:PMC7654321",
+                "doi:10.1000/Example",
+                "PMC:PMC7654321",
+            ]
+        )
+    )
+
+    assert document["pubmed"]["identifiers"] == [
+        "PMC:PMC7654321",
+        "doi:10.1000/Example",
+    ]
+
+
+def test_removes_only_the_exact_primary_pmid_from_alternate_identifiers():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            identifiers=[
+                "PMID:12345678",
+                "PMID:87654321",
+                "PMID:12345678",
+            ]
+        )
+    )
+
+    assert document["_id"] == "PMID:12345678"
+    assert document["pubmed"]["identifiers"] == ["PMID:87654321"]
+
+
+@pytest.mark.parametrize("field", ["pubdate", "pub_date"])
+def test_accepts_verbatim_pubdate_field_during_upstream_transition(field):
+    record = upstream_record(
+        pub_year="1998",
+        pub_month="Dec-1999 Jan",
+        pub_day="",
+    )
+    record[field] = "1998 Dec-1999 Jan"
+
+    document = parser.transform_pubmed_metadata_record(record)
+
+    assert document["pubmed"]["pubdate_raw"] == "1998 Dec-1999 Jan"
+    for component in ("pub_year", "pub_month", "pub_day"):
+        assert component not in document["pubmed"]
+    assert "pub_date" not in document["pubmed"]
+
+
+def test_preserves_verbatim_pubdate_alongside_exact_query_date():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(pubdate="2026 Jun 30")
+    )
+
+    assert document["pubmed"]["pubdate_raw"] == "2026 Jun 30"
+    assert document["pubmed"]["pub_date"] == "2026-06-30"
+
+
+def test_exact_looking_medline_date_remains_raw_only():
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            pub_year="2019",
+            pub_month="Mar 15",
+            pub_day="",
+            pubdate="2019 Mar 15",
+        )
+    )
+
+    assert document["pubmed"]["pubdate_raw"] == "2019 Mar 15"
+    assert "pub_date" not in document["pubmed"]
+
+
 @pytest.mark.parametrize(
     ("record", "message"),
     [
@@ -85,6 +276,18 @@ def test_streams_gzip_ndjson(tmp_path):
         ),
         (upstream_record(id="12345678"), "invalid PubMed identifier"),
         (upstream_record(pub_year=2026), "fields must contain strings: pub_year"),
+        (
+            upstream_record(identifiers="PMID:12345678"),
+            "identifiers must be a list of nonempty strings",
+        ),
+        (
+            upstream_record(identifiers=["PMID:12345678", ""]),
+            "identifiers must be a list of nonempty strings",
+        ),
+        (
+            upstream_record(identifiers=["doi:10.1000/example"]),
+            "identifiers must contain 'PMID:12345678'",
+        ),
     ],
 )
 def test_rejects_invalid_records(record, message):
@@ -93,15 +296,51 @@ def test_rejects_invalid_records(record, message):
 
 
 @pytest.mark.parametrize(
+    ("publication_types", "message"),
+    [
+        ("Review", "publication_types must be a list of objects"),
+        (["Review"], r"publication_types\[0\] must be an object"),
+        (
+            [{"id": "MESH:D016454"}],
+            r"publication_types\[0\]: missing fields: name",
+        ),
+        (
+            [{"id": "MESH:D016454", "name": "Review", "extra": "value"}],
+            r"publication_types\[0\]: unexpected fields: extra",
+        ),
+        (
+            [{"id": "", "name": "Review"}],
+            r"publication_types\[0\]: invalid publication type id ''",
+        ),
+        (
+            [{"id": "MeSH:D016454", "name": "Review"}],
+            r"publication_types\[0\]: invalid publication type id 'MeSH:D016454'",
+        ),
+        (
+            [{"id": None, "name": "Review"}],
+            r"publication_types\[0\]: invalid publication type id None",
+        ),
+        (
+            [{"id": "MESH:D016454", "name": None}],
+            r"publication_types\[0\]: name must be a string",
+        ),
+    ],
+)
+def test_rejects_invalid_publication_types(publication_types, message):
+    with pytest.raises(parser.PubMedMetadataValidationError, match=message):
+        parser.transform_pubmed_metadata_record(
+            upstream_record(publication_types=publication_types)
+        )
+
+
+@pytest.mark.parametrize(
     ("date_parts", "expected_date"),
     [
-        ({"pub_year": "2026", "pub_month": "Jun", "pub_day": ""}, "2026-06"),
-        ({"pub_year": "2026", "pub_month": "", "pub_day": ""}, "2026"),
         ({"pub_year": "2026", "pub_month": "6", "pub_day": "3"}, "2026-06-03"),
         ({"pub_year": "2024", "pub_month": "feb", "pub_day": "29"}, "2024-02-29"),
     ],
 )
-def test_builds_dates_at_available_precision(date_parts, expected_date):
+def test_builds_exact_dates(date_parts, expected_date):
     document = parser.transform_pubmed_metadata_record(
         upstream_record(**date_parts)
     )
@@ -109,42 +348,58 @@ def test_builds_dates_at_available_precision(date_parts, expected_date):
     assert document["pubmed"]["pub_date"] == expected_date
 
 
-def test_omits_date_when_all_components_are_missing():
-    document = parser.transform_pubmed_metadata_record(
-        upstream_record(pub_year="", pub_month="", pub_day="")
-    )
+@pytest.mark.parametrize(
+    "date_parts",
+    [
+        {"pub_year": "2026", "pub_month": "Jun", "pub_day": ""},
+        {"pub_year": "2026", "pub_month": "", "pub_day": ""},
+        {"pub_year": "", "pub_month": "", "pub_day": ""},
+        {"pub_year": "", "pub_month": "Jun", "pub_day": ""},
+        {"pub_year": "2026", "pub_month": "", "pub_day": "15"},
+        {"pub_year": "26", "pub_month": "Jun", "pub_day": "15"},
+        {"pub_year": "2026", "pub_month": "Sep-Dec", "pub_day": ""},
+        {"pub_year": "2026", "pub_month": "Spring", "pub_day": ""},
+        {"pub_year": "1998", "pub_month": "Dec-1999 Jan", "pub_day": ""},
+        {"pub_year": "2026", "pub_month": "Smarch", "pub_day": "15"},
+        {"pub_year": "2026", "pub_month": "13", "pub_day": "15"},
+        {"pub_year": "2026", "pub_month": "Feb", "pub_day": "30"},
+    ],
+)
+def test_discards_input_components_when_no_exact_date_can_be_derived(date_parts):
+    document = parser.transform_pubmed_metadata_record(upstream_record(**date_parts))
 
+    for component in ("pub_year", "pub_month", "pub_day"):
+        assert component not in document["pubmed"]
     assert "pub_date" not in document["pubmed"]
 
 
-@pytest.mark.parametrize(
-    ("date_parts", "message"),
-    [
-        (
-            {"pub_year": "", "pub_month": "Jun", "pub_day": ""},
-            "publication month/day requires a year",
-        ),
-        (
-            {"pub_year": "2026", "pub_month": "", "pub_day": "15"},
-            "publication day requires a month",
-        ),
-        (
-            {"pub_year": "26", "pub_month": "", "pub_day": ""},
-            "invalid publication year",
-        ),
-        (
-            {"pub_year": "2026", "pub_month": "Smarch", "pub_day": ""},
-            "invalid publication month",
-        ),
-        (
-            {"pub_year": "2026", "pub_month": "Feb", "pub_day": "30"},
-            "invalid publication date",
-        ),
-    ],
-)
-def test_rejects_invalid_date_components(date_parts, message):
-    with pytest.raises(parser.PubMedMetadataValidationError, match=message):
-        parser.transform_pubmed_metadata_record(upstream_record(**date_parts))
+def test_rejects_verbatim_pubdate_without_identifiers():
+    record = legacy_record()
+    record["pubdate"] = "2026 Jun 30"
+
+    with pytest.raises(
+        parser.PubMedMetadataValidationError,
+        match="pubdate requires identifiers",
+    ):
+        parser.transform_pubmed_metadata_record(record)
+
+
+def test_rejects_multiple_verbatim_pubdate_fields():
+    record = upstream_record(pubdate="2026 Jun 30", pub_date="2026 Jun 30")
+
+    with pytest.raises(
+        parser.PubMedMetadataValidationError,
+        match="multiple verbatim publication-date fields",
+    ):
+        parser.transform_pubmed_metadata_record(record)
+
+
+def test_rejects_non_string_verbatim_pubdate():
+    with pytest.raises(
+        parser.PubMedMetadataValidationError,
+        match="fields must contain strings: pubdate",
+    ):
+        parser.transform_pubmed_metadata_record(upstream_record(pubdate=20260630))
 
 
 def test_reports_shard_and_line_for_invalid_json(tmp_path):

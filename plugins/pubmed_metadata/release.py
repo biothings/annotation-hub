@@ -1,0 +1,301 @@
+"""Release and shard validation helpers for PubMed metadata snapshots."""
+
+from __future__ import annotations
+
+import gzip
+import json
+import logging
+import re
+from collections.abc import Iterable, Mapping
+from datetime import date
+from html.parser import HTMLParser
+from pathlib import Path
+
+_MONTH_NUMBERS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+_RELEASE_PATTERN = re.compile(
+    r"^(?P<year>\d{4})(?P<month>" + "|".join(_MONTH_NUMBERS) + r")"
+    r"(?P<day>0?[1-9]|[12]\d|3[01])$"
+)
+_SHARD_PATTERN = re.compile(r"^pubmed_metadata_(?P<index>\d+)\.ndjson\.gz$")
+_REQUIRED_STRUCTURE_CHECKS = frozenset(
+    {
+        "shards-found",
+        "records-present",
+        "json-parse",
+        "record-fields",
+        "no-nulls",
+        "id-format",
+        "pmid-unique",
+        "no-extra-fields",
+        "month-format",
+    }
+)
+
+
+class PubMedReleaseError(ValueError):
+    """Raised when an upstream release cannot be trusted for ingestion."""
+
+
+class _LinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() != "a":
+            return
+        for key, value in attrs:
+            if key.casefold() == "href" and value is not None:
+                self.hrefs.append(value)
+                return
+
+
+def extract_index_hrefs(index_html: str) -> tuple[str, ...]:
+    """Return links from an HTTP directory index without interpreting them."""
+
+    parser = _LinkParser()
+    parser.feed(index_html)
+    parser.close()
+    return tuple(parser.hrefs)
+
+
+def release_date(release: str) -> date:
+    """Parse RENCI's ``YYYYmonD`` or ``YYYYmonDD`` directory convention."""
+
+    if not isinstance(release, str):
+        raise PubMedReleaseError(f"invalid PubMed release name: {release!r}")
+    match = _RELEASE_PATTERN.fullmatch(release)
+    if match is None:
+        raise PubMedReleaseError(f"invalid PubMed release name: {release!r}")
+    try:
+        return date(
+            int(match.group("year")),
+            _MONTH_NUMBERS[match.group("month")],
+            int(match.group("day")),
+        )
+    except ValueError as exc:
+        raise PubMedReleaseError(f"invalid PubMed release date: {release!r}") from exc
+
+
+def releases_from_index(
+    index_html: str, *, logger: logging.Logger | None = None
+) -> tuple[str, ...]:
+    """Return valid release directory names, newest first."""
+
+    releases: dict[str, date] = {}
+    for href in extract_index_hrefs(index_html):
+        if not href.endswith("/") or href.count("/") != 1:
+            continue
+        release = href[:-1]
+        try:
+            releases[release] = release_date(release)
+        except PubMedReleaseError:
+            if logger is not None and re.match(r"^\d{4}", release):
+                logger.warning(
+                    "Unrecognized PubMed release directory %r",
+                    release,
+                    extra={"notify": True},
+                )
+            continue
+    sorted_releases = sorted(releases.items(), key=lambda item: item[1], reverse=True)
+    return tuple(release for release, _ in sorted_releases)
+
+
+def find_validation_report_filename(
+    filenames: Iterable[str], release: str
+) -> str | None:
+    """Find a legacy or date-matched JSON report, with optional gzip."""
+
+    names = set(filenames)
+    for name in ("validation_report.json.gz", "validation_report.json"):
+        if name in names:
+            return name
+    dated_name = f"validation_report-{release_date(release):%Y%m%d}.json"
+    return next(
+        (name for name in (dated_name, dated_name + ".gz") if name in names), None
+    )
+
+
+def validate_shard_filenames(filenames: Iterable[str]) -> tuple[str, ...]:
+    """Return the actual shard names, sorted by a contiguous numeric index."""
+
+    indexed_names: dict[int, str] = {}
+    for filename in filenames:
+        match = _SHARD_PATTERN.fullmatch(filename)
+        if match is None:
+            continue
+        index = int(match.group("index"))
+        if index in indexed_names:
+            raise PubMedReleaseError(f"duplicate PubMed shard index: {index}")
+        indexed_names[index] = filename
+
+    if not indexed_names:
+        raise PubMedReleaseError("PubMed release contains no metadata shards")
+
+    expected_indices = list(range(len(indexed_names)))
+    actual_indices = sorted(indexed_names)
+    if actual_indices != expected_indices:
+        expected = ", ".join(str(index) for index in expected_indices)
+        actual = ", ".join(str(index) for index in actual_indices)
+        raise PubMedReleaseError(
+            "PubMed shard indices must be contiguous from 0; "
+            f"expected [{expected}], found [{actual}]"
+        )
+
+    return tuple(indexed_names[index] for index in actual_indices)
+
+
+def parse_validation_report(payload: bytes) -> Mapping:
+    """Decode either a gzip-compressed or plain JSON validation report."""
+
+    try:
+        if payload.startswith(b"\x1f\x8b"):
+            decoded_payload = gzip.decompress(payload)
+        else:
+            decoded_payload = payload
+        report = json.loads(decoded_payload.decode("utf-8"))
+    except (EOFError, OSError) as exc:
+        raise PubMedReleaseError(
+            "PubMed validation report is not valid gzip-compressed JSON"
+        ) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+        raise PubMedReleaseError("PubMed validation report is not valid JSON") from exc
+    if not isinstance(report, Mapping):
+        raise PubMedReleaseError("PubMed validation report is not a JSON object")
+    return report
+
+
+def validate_report(report: object, shard_filenames: Iterable[str]) -> None:
+    """Validate the upstream report as a completion and structure gate."""
+
+    if not isinstance(report, Mapping):
+        raise PubMedReleaseError("PubMed validation report is not a JSON object")
+    if report.get("status") not in {"pass", "warn"}:
+        raise PubMedReleaseError("PubMed validation report did not complete safely")
+    if report.get("errors") != []:
+        raise PubMedReleaseError("PubMed validation report contains errors")
+
+    checks_run = report.get("checks_run")
+    if not isinstance(checks_run, list):
+        raise PubMedReleaseError("PubMed validation report has no checks_run list")
+    structure_checks = [
+        check
+        for check in checks_run
+        if isinstance(check, Mapping) and check.get("section") == "structure"
+    ]
+    if not structure_checks:
+        raise PubMedReleaseError(
+            "PubMed validation report did not pass all structure checks"
+        )
+
+    structure_check_names: set[str] = set()
+    for check in structure_checks:
+        name = check.get("name")
+        if not isinstance(name, str) or not name:
+            raise PubMedReleaseError(
+                "PubMed validation report has an unnamed structure check"
+            )
+        if name in structure_check_names:
+            raise PubMedReleaseError(
+                f"PubMed validation report repeats structure check: {name}"
+            )
+        structure_check_names.add(name)
+
+        allowed_statuses = {"pass", "warn"} if name == "month-format" else {"pass"}
+        if check.get("status") not in allowed_statuses:
+            raise PubMedReleaseError(
+                "PubMed validation report did not pass all structure checks"
+            )
+
+    missing_checks = sorted(_REQUIRED_STRUCTURE_CHECKS - structure_check_names)
+    if missing_checks:
+        raise PubMedReleaseError(
+            "PubMed validation report is missing required structure checks: "
+            + ", ".join(missing_checks)
+        )
+
+    inputs = report.get("inputs")
+    report_shards = inputs.get("shards") if isinstance(inputs, Mapping) else None
+    if not isinstance(report_shards, list) or not all(
+        isinstance(name, str) for name in report_shards
+    ):
+        raise PubMedReleaseError(
+            "PubMed validation report has no valid shard inventory"
+        )
+
+    compressed_report_shards = tuple(
+        f"{name}.gz" if name.endswith(".ndjson") else name for name in report_shards
+    )
+    try:
+        validated_report_shards = validate_shard_filenames(compressed_report_shards)
+        expected_shards = validate_shard_filenames(shard_filenames)
+    except PubMedReleaseError as exc:
+        raise PubMedReleaseError(
+            f"PubMed validation report has an invalid shard inventory: {exc}"
+        ) from exc
+    if len(validated_report_shards) != len(report_shards):
+        raise PubMedReleaseError(
+            "PubMed validation report has an invalid shard inventory"
+        )
+    if validated_report_shards != expected_shards:
+        raise PubMedReleaseError(
+            "PubMed validation report shard inventory does not match the release directory"
+        )
+
+    checks = report.get("checks")
+    structure = checks.get("structure") if isinstance(checks, Mapping) else None
+    records_total = (
+        structure.get("records_total") if isinstance(structure, Mapping) else None
+    )
+    if (
+        not isinstance(records_total, int)
+        or isinstance(records_total, bool)
+        or records_total <= 0
+    ):
+        raise PubMedReleaseError(
+            "PubMed validation report has no positive record count"
+        )
+
+
+def local_shard_paths(
+    data_folder: str | Path, validation_report_filename: str | None = None
+) -> tuple[Path, ...]:
+    """Validate and return the downloaded shards in one release folder."""
+
+    folder = Path(data_folder)
+    try:
+        filenames = [path.name for path in folder.iterdir() if path.is_file()]
+    except OSError as exc:
+        raise PubMedReleaseError(
+            f"unable to list PubMed release folder {folder}: {exc}"
+        ) from exc
+
+    shard_filenames = validate_shard_filenames(filenames)
+    if validation_report_filename is None:
+        validation_report_filename = find_validation_report_filename(
+            filenames, folder.name
+        )
+        if validation_report_filename is None:
+            raise PubMedReleaseError(f"no matching completion report in {folder}")
+    report_path = folder / validation_report_filename
+    try:
+        report = parse_validation_report(report_path.read_bytes())
+    except OSError as exc:
+        raise PubMedReleaseError(
+            f"unable to read PubMed validation report {report_path}: {exc}"
+        ) from exc
+    validate_report(report, shard_filenames)
+    return tuple(folder / filename for filename in shard_filenames)
