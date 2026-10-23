@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import re
 from collections.abc import Iterable, Mapping
 from datetime import date
@@ -25,7 +26,7 @@ _MONTH_NUMBERS = {
     "dec": 12,
 }
 _RELEASE_PATTERN = re.compile(
-    r"^(?P<year>\d{4})(?P<month>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+    r"^(?P<year>\d{4})(?P<month>" + "|".join(_MONTH_NUMBERS) + r")"
     r"(?P<day>0?[1-9]|[12]\d|3[01])$"
 )
 _SHARD_PATTERN = re.compile(r"^pubmed_metadata_(?P<index>\d+)\.ndjson\.gz$")
@@ -89,7 +90,9 @@ def release_date(release: str) -> date:
         raise PubMedReleaseError(f"invalid PubMed release date: {release!r}") from exc
 
 
-def releases_from_index(index_html: str) -> tuple[str, ...]:
+def releases_from_index(
+    index_html: str, *, logger: logging.Logger | None = None
+) -> tuple[str, ...]:
     """Return valid release directory names, newest first."""
 
     releases: dict[str, date] = {}
@@ -100,9 +103,30 @@ def releases_from_index(index_html: str) -> tuple[str, ...]:
         try:
             releases[release] = release_date(release)
         except PubMedReleaseError:
+            if logger is not None and re.match(r"^\d{4}", release):
+                logger.warning(
+                    "Unrecognized PubMed release directory %r",
+                    release,
+                    extra={"notify": True},
+                )
             continue
     sorted_releases = sorted(releases.items(), key=lambda item: item[1], reverse=True)
     return tuple(release for release, _ in sorted_releases)
+
+
+def find_validation_report_filename(
+    filenames: Iterable[str], release: str
+) -> str | None:
+    """Find a legacy or date-matched JSON report, with optional gzip."""
+
+    names = set(filenames)
+    for name in ("validation_report.json.gz", "validation_report.json"):
+        if name in names:
+            return name
+    dated_name = f"validation_report-{release_date(release):%Y%m%d}.json"
+    return next(
+        (name for name in (dated_name, dated_name + ".gz") if name in names), None
+    )
 
 
 def validate_shard_filenames(filenames: Iterable[str]) -> tuple[str, ...]:
@@ -247,7 +271,7 @@ def validate_report(report: object, shard_filenames: Iterable[str]) -> None:
 
 
 def local_shard_paths(
-    data_folder: str | Path, validation_report_filename: str
+    data_folder: str | Path, validation_report_filename: str | None = None
 ) -> tuple[Path, ...]:
     """Validate and return the downloaded shards in one release folder."""
 
@@ -260,6 +284,12 @@ def local_shard_paths(
         ) from exc
 
     shard_filenames = validate_shard_filenames(filenames)
+    if validation_report_filename is None:
+        validation_report_filename = find_validation_report_filename(
+            filenames, folder.name
+        )
+        if validation_report_filename is None:
+            raise PubMedReleaseError(f"no matching completion report in {folder}")
     report_path = folder / validation_report_filename
     try:
         report = parse_validation_report(report_path.read_bytes())

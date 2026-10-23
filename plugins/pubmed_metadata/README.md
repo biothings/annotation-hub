@@ -82,22 +82,45 @@ responses is the adapter's responsibility rather than an Elasticsearch mapping
 concern.
 
 Before queueing a large download, the dumper requires a published completion
-report. It supports the legacy release-local `validation_report.json.gz`, the
-dated `manifests/validation_report-YYYYMMDD.json` beside all releases, and the
-newer release-local
-`<release>/manifests/validation_report-YYYYMMDD.json` layout. A release-local
+report. It recognizes `validation_report.json` and date-matched
+`validation_report-YYYYMMDD.json`, optionally gzip-compressed, directly in a
+release, in `<release>/manifests/`, or in the root `manifests/` directory.
+A release-local
 manifests directory is authoritative for that release. The dumper accepts
 gzip-compressed and plain JSON reports, verifies that the report has no errors,
 and confirms that its shard inventory matches a nonempty set of numerically
 contiguous files beginning at shard `0`. Both legacy zero-padded and current
 unpadded `pubmed_metadata_<index>.ndjson.gz` names are supported. A release
-without an exact matching completion report is treated as incomplete; a release
+without a matching completion report is treated as incomplete; a release
 with a report that fails validation stops discovery instead of falling back to
 an older snapshot. The selected report is retained alongside the downloaded
 shards for auditability and checked again after download. `month-format` is the
 only structural check allowed to warn; every other reported structural check
 must pass. Advisory warnings outside the structure section remain allowed when
 the error list is empty.
+
+Contiguous shard sets without a recognized report emit a warning with Hub
+notification enabled, as do unsupported date-like release-directory names.
+Discovery requests retry connection failures, timeouts, HTTP 429, and transient
+5xx responses up to four times with exponential backoff. A discovered release
+older than the recorded or last successful release is refused even for a
+forced dump. A canceled or incomplete download is retried instead of being
+mistaken for a completed release. After a discovery-only failure, a validated
+previously successful snapshot can be restored to successful status without
+downloading or uploading it again. An operator's explicit `force=True` still
+downloads the current release again. Post-processing can also be run on a fresh
+dumper instance with `steps="post"`, including after a separate `steps="dump"`
+run; dump and upload use the same local report lookup.
+
+After successful post-validation, local archive cleanup retains the current
+snapshot and one validated rollback snapshot. The recorded last successful
+release takes priority as the rollback snapshot. Configure
+`PUBMED_METADATA_KEEP_ARCHIVED_RELEASES` to an integer of at least two to retain
+more, or to `None` to retain all snapshots. Cleanup only removes older validated
+release folders within this source's archive root; incomplete, unrecognized,
+newer, and symlinked folders are left alone. Cleanup failures generate a warning
+instead of failing a valid download. This file-retention setting is independent
+of the uploader's MongoDB collection retention.
 
 Downloads and uploads are each capped at four concurrent shards. Dumps are not
 scheduled automatically because each full snapshot is very large; an operator

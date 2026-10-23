@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 PLUGIN_PATH = Path(__file__).parents[1] / "plugins" / "pubmed_metadata"
 STRUCTURE_CHECK_NAMES = (
     "shards-found",
@@ -90,7 +89,9 @@ def test_jobs_uses_legacy_gzip_report_before_dated_report(tmp_path, uploader_mod
     data_folder = tmp_path / "2026aug5"
     shard_paths = write_release(data_folder, padded=True)
     legacy_report = json.dumps(validation_report(padded=True)).encode("utf-8")
-    (data_folder / "validation_report.json.gz").write_bytes(gzip.compress(legacy_report))
+    (data_folder / "validation_report.json.gz").write_bytes(
+        gzip.compress(legacy_report)
+    )
     (data_folder / "validation_report-20260805.json").write_bytes(b"not JSON")
 
     uploader = uploader_module.PubMedMetadataUploader()
@@ -108,6 +109,18 @@ def test_jobs_uses_dated_plain_json_report_for_new_layout(tmp_path, uploader_mod
     uploader = uploader_module.PubMedMetadataUploader()
     uploader.data_folder = str(data_folder)
 
+    assert uploader.jobs() == [(str(path),) for path in shard_paths]
+
+
+def test_jobs_uses_dated_gzip_report_for_new_layout(tmp_path, uploader_module):
+    data_folder = tmp_path / "2026sep26"
+    shard_paths = write_release(data_folder, padded=False)
+    report = json.dumps(validation_report(padded=False)).encode("utf-8")
+    (data_folder / "validation_report-20260926.json.gz").write_bytes(
+        gzip.compress(report)
+    )
+    uploader = uploader_module.PubMedMetadataUploader()
+    uploader.data_folder = str(data_folder)
     assert uploader.jobs() == [(str(path),) for path in shard_paths]
 
 
@@ -131,7 +144,9 @@ def test_jobs_rejects_missing_or_wrong_date_dated_report(
         uploader.jobs()
 
 
-def test_jobs_rejects_new_layout_in_an_invalid_release_folder(tmp_path, uploader_module):
+def test_jobs_rejects_new_layout_in_an_invalid_release_folder(
+    tmp_path, uploader_module
+):
     data_folder = tmp_path / "not-a-release"
     write_release(data_folder, padded=False)
     report = json.dumps(validation_report(padded=False)).encode("utf-8")

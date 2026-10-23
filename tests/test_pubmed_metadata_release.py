@@ -88,6 +88,38 @@ def test_release_discovery_sorts_dates_and_ignores_unrelated_links():
     )
 
 
+def test_unrecognized_dated_release_directories_emit_notifications(caplog):
+    import logging
+
+    logger = logging.getLogger("pubmed-release-test")
+    with caplog.at_level(logging.WARNING):
+        releases = release.releases_from_index(
+            index_html("2026sept26/", "2026sep26/", "manifests/"), logger=logger
+        )
+    assert releases == ("2026sep26",)
+    assert len(caplog.records) == 1
+    assert caplog.records[0].notify is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "validation_report.json.gz",
+        "validation_report.json",
+        "validation_report-20260926.json",
+        "validation_report-20260926.json.gz",
+    ],
+)
+def test_report_lookup_supports_plain_and_compressed_reports(name):
+    assert release.find_validation_report_filename([name], "2026sep26") == name
+    assert (
+        release.find_validation_report_filename(
+            ["validation_report-20260925.json"], "2026sep26"
+        )
+        is None
+    )
+
+
 def test_shard_validation_accepts_a_contiguous_dynamic_inventory():
     filenames = [
         "validation_report.json.gz",
@@ -155,9 +187,9 @@ def test_validation_report_allows_month_format_warning_for_new_shards():
             ]
         }
     )
-    next(
-        check for check in report["checks_run"] if check["name"] == "month-format"
-    )["status"] = "warn"
+    next(check for check in report["checks_run"] if check["name"] == "month-format")[
+        "status"
+    ] = "warn"
 
     release.validate_report(
         report,
@@ -170,9 +202,9 @@ def test_validation_report_allows_month_format_warning_for_new_shards():
 
 def test_validation_report_rejects_other_structure_warnings():
     report = validation_report()
-    next(
-        check for check in report["checks_run"] if check["name"] == "record-fields"
-    )["status"] = "warn"
+    next(check for check in report["checks_run"] if check["name"] == "record-fields")[
+        "status"
+    ] = "warn"
 
     with pytest.raises(
         release.PubMedReleaseError, match="did not pass all structure checks"
@@ -272,9 +304,9 @@ def test_local_unpadded_shards_use_a_plain_json_report(tmp_path):
     for shard_name in reversed(shard_names):
         (tmp_path / shard_name).touch()
     report = validation_report(inputs={"shards": shard_names})
-    next(
-        check for check in report["checks_run"] if check["name"] == "month-format"
-    )["status"] = "warn"
+    next(check for check in report["checks_run"] if check["name"] == "month-format")[
+        "status"
+    ] = "warn"
     report_filename = "validation_report-20260821.json"
     (tmp_path / report_filename).write_text(json.dumps(report), encoding="utf-8")
 
