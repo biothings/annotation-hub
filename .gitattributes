@@ -1,0 +1,2 @@
+# Unified diff context includes space-prefixed blank lines by design.
+patches/multiomics/*.patch -whitespace
