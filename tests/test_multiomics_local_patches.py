@@ -3,9 +3,13 @@
 import gzip
 import importlib.util
 import json
+import logging
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
+import sys
+import types
 
 import pytest
 
@@ -343,3 +347,116 @@ def test_corrupt_input_propagates_without_partial_success(
         error = KeyError
     with pytest.raises(error):
         next(_parser(prepared).load_data(str(folder)))
+
+
+@pytest.mark.parametrize("scenario", ["revision", "local_edit", "write_error", "ready"])
+def test_hub_startup_continues_and_registers_only_prepared_sources(
+    checkout, monkeypatch, caplog, scenario
+):
+    if scenario == "revision":
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout / ENTRIES[1]["path"]),
+                "checkout",
+                "--detach",
+                "HEAD^",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    elif scenario == "local_edit":
+        path = checkout / ENTRIES[1]["path"] / "annotator_parser.py"
+        path.write_text(path.read_text() + "\n# existing local edit\n")
+
+    prepare = PREPARE.prepare_multiomics
+
+    def prepare_checkout(*args, **kwargs):
+        if scenario == "write_error":
+            raise OSError("read-only plugin files")
+        return prepare(checkout, **kwargs)
+
+    monkeypatch.setattr(PREPARE, "prepare_multiomics", prepare_checkout)
+    monkeypatch.setitem(sys.modules, "prepare_multiomics", PREPARE)
+
+    modules = {
+        name: types.ModuleType(name)
+        for name in [
+            "config",
+            "biothings",
+            "biothings.utils",
+            "biothings.utils.version",
+            "biothings.hub",
+            "hub",
+            "hub.dataload",
+            "hub.dataload.sources",
+        ]
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    logger = logging.getLogger("multiomics-startup-test")
+    modules["config"].logger = logger
+    modules["config"].HUB_NAME = "test hub"
+    modules["biothings"].config = types.SimpleNamespace(
+        HUB_DB_BACKEND="test", DATA_HUB_DB_DATABASE="test"
+    )
+    modules["biothings.utils.version"].set_versions = lambda *args: None
+    modules["hub"].dataload = modules["hub.dataload"]
+    modules["hub.dataload"].sources = modules["hub.dataload.sources"]
+
+    unrelated = [
+        type(name, (), {"SRC_NAME": name}) for name in ["pubmed_metadata", "nodenorm"]
+    ]
+    multiomics = [
+        type("Multiomics" + str(i), (), {"SRC_NAME": entry["path"].split("/")[-1]})
+        for i, entry in enumerate(ENTRIES)
+    ]
+
+    class Manager:
+        def __init__(self):
+            self.register = []
+            self.logger = logger
+
+        def register_classes(self, klasses):
+            self.register.extend(klasses)
+
+    class HubServer:
+        def __init__(self, source_list, name):
+            self.managers = {
+                key: Manager()
+                for key in ["dump_manager", "upload_manager", "dataplugin_manager"]
+            }
+
+        def configure_source_manager(self):
+            for manager in self.managers.values():
+                manager.register_classes(unrelated + multiomics)
+
+        def start(self):
+            self.configure_source_manager()
+            self.started = True
+
+    modules["biothings.hub"].HubServer = HubServer
+    import asyncio
+
+    monkeypatch.setattr(asyncio, "new_event_loop", lambda: None)
+    monkeypatch.setattr(asyncio, "set_event_loop", lambda loop: None)
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        namespace = runpy.run_path(str(ROOT / "bin" / "hub.py"), run_name="__main__")
+    server = namespace["server"]
+    assert server.started
+    expected = unrelated + multiomics if scenario == "ready" else unrelated
+    for manager in server.managers.values():
+        assert manager.register == expected
+        # The same protection applies to a later reload or manual registration.
+        manager.register_classes(multiomics)
+        assert manager.register == (
+            expected + multiomics if scenario == "ready" else expected
+        )
+    if scenario == "ready":
+        assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+    else:
+        assert any(
+            record.levelno == logging.ERROR and getattr(record, "notify", False)
+            for record in caplog.records
+        )

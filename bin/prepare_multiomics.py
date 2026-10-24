@@ -15,6 +15,54 @@ class PatchError(RuntimeError):
     """A checkout cannot safely receive the expected local patch."""
 
 
+_MULTIOMICS_IDENTIFIERS = frozenset(
+    {
+        "multiomics_clinicaltrials_kp",
+        "multiomics_drug_approvals_kp",
+        "clinical_trials_kp",
+        "drug_approvals_kp",
+        "multiomics_clinical_trials",
+        "multiomics_drug_approvals",
+        "multiomics_clinical_trials_annotator",
+        "multiomics_drug_approvals_annotator",
+    }
+)
+
+
+def block_unprepared_multiomics(manager, logger) -> None:
+    """Reject Multiomics registration for this manager, including later reloads."""
+    if getattr(manager, "_multiomics_registration_blocked", False):
+        return
+    register_classes = manager.register_classes
+
+    def register_prepared_classes(klasses):
+        allowed = []
+        for klass in klasses:
+            names = (
+                getattr(klass, key, None) for key in ("SRC_NAME", "name", "main_source")
+            )
+            blocked = any(
+                isinstance(name, str) and name in _MULTIOMICS_IDENTIFIERS
+                for name in names
+            )
+            for key in ("DATA_PLUGIN_FOLDER", "SRC_ROOT_FOLDER"):
+                folder = getattr(klass, key, None)
+                if isinstance(folder, (str, os.PathLike)):
+                    blocked = blocked or Path(folder).name in _MULTIOMICS_IDENTIFIERS
+            if blocked:
+                logger.error(
+                    "Skipping unprepared Multiomics source class %s", klass.__name__
+                )
+            else:
+                allowed.append(klass)
+        if allowed:
+            return register_classes(allowed)
+        return None
+
+    manager.register_classes = register_prepared_classes
+    manager._multiomics_registration_blocked = True
+
+
 def _git(folder: Path, *arguments: str) -> bytes:
     result = subprocess.run(
         ["git", "-C", str(folder), *arguments], capture_output=True, check=False

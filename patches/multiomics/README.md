@@ -42,6 +42,13 @@ upstream files, files already patched by this tool, and the known annotation-onl
 manifest override used on su06. Other local edits stop preparation and are left
 untouched. Existing data folders and running services are not modified.
 
+If preparation fails at hub startup, an error with `notify` reports the cause.
+The hub continues starting its other sources while blocking Multiomics dumper,
+uploader, and data-plugin registration for that process, including later reloads
+or registration attempts. No unprepared Multiomics sources can be scheduled.
+Fix the revision/local-edit problem and restart the hub to enable them again.
+The standalone preparation command still fails with a nonzero exit status.
+
 When advancing a submodule, review and regenerate its patch and update
 `patches.json` together. Do not just change the expected revision to bypass the
 guard. To discard these local changes deliberately, restore the two patched
