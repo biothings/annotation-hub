@@ -12,6 +12,11 @@ Once they're setup you start the hub by running the following command at the roo
 PYTHONPATH=. python3 ./bin/hub.py
 ```
 
+Initialize the Multiomics submodules with `git submodule update --init`. Hub
+startup applies annotation-hub's local integration patches before loading them.
+See [the patch instructions](patches/multiomics/README.md) for manual preparation,
+versioned downloads, and local-edit safeguards.
+
 ## Plugins
 
 We have 3 groups of plugins based off which web api they feed

@@ -9,6 +9,12 @@ app_folder, _src = os.path.split(os.path.split(os.path.abspath(__file__))[0])
 set_versions(config, app_folder)
 logging = config.logger
 
+from prepare_multiomics import prepare_multiomics
+
+patched_files = prepare_multiomics(app_folder, allow_missing=True)
+if patched_files:
+    logging.info("Applied local Multiomics patches: %s", ", ".join(patched_files))
+
 
 from biothings.hub import HubServer
 import hub.dataload.sources

@@ -1,0 +1,75 @@
+--- a/manifest.json
++++ b/manifest.json
+@@ -7,21 +7,17 @@
+     },
+     "dumper": {
+         "data_url": [
+-            "https://db.systemsbiology.net/gestalt/KG/drug_approvals_kg_nodes_current.jsonl.gz",
+-            "https://db.systemsbiology.net/gestalt/KG/drug_approvals_kg_edges_current.jsonl.gz"
++            "https://db.systemsbiology.net/gestalt/KG/drug_approvals_kg_nodes_v0.5.7.jsonl.gz",
++            "https://db.systemsbiology.net/gestalt/KG/drug_approvals_kg_edges_v0.5.7.jsonl.gz"
+         ],
+         "uncompress": false,
+         "release": "version:get_release"
+     },
+-    "uploaders": [{
+-        "name": "multiomics_drug_approvals",
+-        "parser": "file_parser:load_data",
+-        "on_duplicates": "ignore"
+-    },
+-    {
+-        "name": "multiomics_drug_approvals_annotator",
+-        "parser": "annotator_parser:load_data",
+-        "on_duplicates": "ignore"
+-    }
++    "uploaders": [
++        {
++            "name": "multiomics_drug_approvals_annotator",
++            "parser": "annotator_parser:load_data",
++            "on_duplicates": "ignore"
++        }
+     ]
+ }
+--- a/annotator_parser.py
++++ b/annotator_parser.py
+@@ -6,7 +6,7 @@
+ kgInfoUrl = "https://db.systemsbiology.net/gestalt/cgi-pub/KGinfo.pl?id="
+ 
+ def find_file(data_folder, kind):
+-    matches = sorted(glob.glob(os.path.join(data_folder, f"drug_approvals_kg_{kind}_current.jsonl*")))
++    matches = sorted(glob.glob(os.path.join(data_folder, f"drug_approvals_kg_{kind}_v0.5.7.jsonl*")))
+     if not matches:
+         raise FileNotFoundError(f"No drug_approvals_kg_{kind}*.jsonl* file in {data_folder}")
+     return matches[-1]
+@@ -54,6 +54,7 @@
+                 data = {
+                     "disease": disease,
+                     "edge_id": line['id'],
++                    "predicate": pred,
+                     "source_record_urls": [ source_record_url ]
+                 }
+ 
+@@ -70,10 +71,7 @@
+ def load_data(data_folder):
+     output = {}
+     final = []
+-    edges = load_content(data_folder)
+-    while 1:
+-        try: subj, entry = next(edges)
+-        except: break
++    for subj, entry in load_content(data_folder):
+         if subj in output:
+             output[subj].append(entry)
+         else:
+@@ -84,10 +82,7 @@
+         yield entry
+ 
+ def main():
+-    gen = load_data('test')
+-    while 1:
+-        try: entry = next(gen)
+-        except: break
++    for entry in load_data('test'):
+         print(json.dumps(entry, sort_keys=True, indent=2))
+ 
+ if __name__ == '__main__':
