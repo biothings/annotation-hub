@@ -89,25 +89,34 @@ class PubMedMetadataDumper(HTTPDumper):
         index_response = self._get(release_url)
         filenames = extract_index_hrefs(index_response.text)
 
-        report_filename = find_validation_report_filename(filenames, release)
-        if report_filename is not None:
-            report_url = urljoin(release_url, report_filename)
-        else:
+        try:
+            report_filename = find_validation_report_filename(
+                filenames, release, release_local=True
+            )
+            report_url = (
+                urljoin(release_url, report_filename)
+                if report_filename is not None
+                else None
+            )
             if f"{MANIFESTS_DIRECTORY}/" in filenames:
                 release_manifests_url = urljoin(release_url, f"{MANIFESTS_DIRECTORY}/")
                 release_manifests_response = self._get(release_manifests_url)
                 release_manifest_filenames = extract_index_hrefs(
                     release_manifests_response.text
                 )
-                report_filename = find_validation_report_filename(
-                    release_manifest_filenames, release
+                nested_report_filename = find_validation_report_filename(
+                    release_manifest_filenames, release, release_local=True
                 )
-                report_url = (
-                    urljoin(release_manifests_url, report_filename)
-                    if report_filename is not None
-                    else None
-                )
-            else:
+                if nested_report_filename is not None:
+                    if report_filename is not None:
+                        raise PubMedReleaseError(
+                            "ambiguous PubMed validation reports: "
+                            f"{report_filename}, {MANIFESTS_DIRECTORY}/"
+                            f"{nested_report_filename}"
+                        )
+                    report_filename = nested_report_filename
+                    report_url = urljoin(release_manifests_url, report_filename)
+            elif report_filename is None:
                 report_filename = find_validation_report_filename(
                     get_global_manifest_filenames(), release
                 )
@@ -118,6 +127,8 @@ class PubMedMetadataDumper(HTTPDumper):
                     if report_filename is not None
                     else None
                 )
+        except PubMedReleaseError as exc:
+            raise DumperException(f"Invalid PubMed release {release}: {exc}") from exc
 
         if report_filename is None:
             try:

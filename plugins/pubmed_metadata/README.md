@@ -82,11 +82,17 @@ responses is the adapter's responsibility rather than an Elasticsearch mapping
 concern.
 
 Before queueing a large download, the dumper requires a published completion
-report. It recognizes `validation_report.json` and date-matched
+report. It recognizes `validation_report.json` and dated
 `validation_report-YYYYMMDD.json`, optionally gzip-compressed, directly in a
 release, in `<release>/manifests/`, or in the root `manifests/` directory.
-A release-local
-manifests directory is authoritative for that release. The dumper accepts
+Within a release's own directory or its `manifests/` subdirectory, the report
+date may differ from the release date (for example, `2026nov08/manifests/` can
+contain `validation_report-20261109.json`). There must be exactly one matching
+report across those two locations; multiple reports, including both plain and
+compressed copies, stop discovery as ambiguous. Unrelated JSON files such as
+`metadata.json` are ignored. In the shared root `manifests/` directory, dated
+reports must still match the release date. A release-local manifests directory
+is authoritative for that release. The dumper accepts
 gzip-compressed and plain JSON reports, verifies that the report has no errors,
 and confirms that its shard inventory matches a nonempty set of numerically
 contiguous files beginning at shard `0`. Both legacy zero-padded and current

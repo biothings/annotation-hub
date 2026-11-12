@@ -30,6 +30,7 @@ _RELEASE_PATTERN = re.compile(
     r"(?P<day>0?[1-9]|[12]\d|3[01])$"
 )
 _SHARD_PATTERN = re.compile(r"^pubmed_metadata_(?P<index>\d+)\.ndjson\.gz$")
+_REPORT_PATTERN = re.compile(r"^validation_report(?:-[0-9]{8})?\.json(?:\.gz)?$")
 _REQUIRED_STRUCTURE_CHECKS = frozenset(
     {
         "shards-found",
@@ -115,18 +116,26 @@ def releases_from_index(
 
 
 def find_validation_report_filename(
-    filenames: Iterable[str], release: str
+    filenames: Iterable[str], release: str, *, release_local: bool = False
 ) -> str | None:
-    """Find a legacy or date-matched JSON report, with optional gzip."""
+    """Find one report, allowing any report date only within its release."""
 
     names = set(filenames)
-    for name in ("validation_report.json.gz", "validation_report.json"):
-        if name in names:
-            return name
     dated_name = f"validation_report-{release_date(release):%Y%m%d}.json"
-    return next(
-        (name for name in (dated_name, dated_name + ".gz") if name in names), None
-    )
+    if release_local:
+        candidates = sorted(name for name in names if _REPORT_PATTERN.fullmatch(name))
+    else:
+        candidates = sorted(names & {
+            "validation_report.json.gz",
+            "validation_report.json",
+            dated_name,
+            dated_name + ".gz",
+        })
+    if len(candidates) > 1:
+        raise PubMedReleaseError(
+            "ambiguous PubMed validation reports: " + ", ".join(candidates)
+        )
+    return candidates[0] if candidates else None
 
 
 def validate_shard_filenames(filenames: Iterable[str]) -> tuple[str, ...]:
@@ -286,7 +295,7 @@ def local_shard_paths(
     shard_filenames = validate_shard_filenames(filenames)
     if validation_report_filename is None:
         validation_report_filename = find_validation_report_filename(
-            filenames, folder.name
+            filenames, folder.name, release_local=True
         )
         if validation_report_filename is None:
             raise PubMedReleaseError(f"no matching completion report in {folder}")

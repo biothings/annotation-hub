@@ -342,6 +342,7 @@ def test_legacy_release_does_not_require_the_manifest_index(dumper_module):
             "validation_report.json.gz",
         )
     )
+    responses[f"{ROOT_URL}2026aug5/manifests/"] = FakeResponse(text=index_html())
     dumper = dumper_module.PubMedMetadataDumper()
     dumper.client = FakeClient(responses)
     dumper._current_release = "2026jun30"
@@ -420,6 +421,9 @@ def test_dumper_selects_release_local_nested_manifest(dumper_module):
 
 def test_release_local_manifest_is_authoritative(dumper_module):
     responses = nested_manifest_responses(exact_report=False)
+    responses[f"{ROOT_URL}2026sep26/manifests/"] = FakeResponse(
+        text=index_html("metadata.json")
+    )
     report_filename = "validation_report-20260926.json"
     responses[f"{ROOT_URL}manifests/"] = FakeResponse(
         text=index_html("validation_report-20260821.json", report_filename)
@@ -453,6 +457,68 @@ def test_completed_invalid_nested_manifest_release_never_falls_back(dumper_modul
 
     requested_urls = [url for url, _ in dumper.client.calls]
     assert f"{ROOT_URL}2026aug21/" not in requested_urls
+
+
+@pytest.mark.parametrize("location", ["release", "nested"])
+@pytest.mark.parametrize("compressed", [False, True])
+def test_next_day_report_is_queued_and_revalidated(dumper_module, location, compressed):
+    responses = release_responses()
+    responses[ROOT_URL] = FakeResponse(text=index_html("2026nov08/", "2026aug5/"))
+    name = "validation_report-20261109.json" + (".gz" if compressed else "")
+    base = f"{ROOT_URL}2026nov08/"
+    shard_names = [f"pubmed_metadata_{i}.ndjson.gz" for i in range(2)]
+    responses[base] = FakeResponse(text=index_html(
+        *shard_names, "metadata.json", name if location == "release" else "manifests/"
+    ))
+    if location == "nested":
+        base += "manifests/"
+        responses[base] = FakeResponse(text=index_html(name, "metadata.json"))
+    payload = plain_report(padded=False, compressed=True)
+    responses[base + name] = FakeResponse(
+        content=gzip.compress(payload) if compressed else payload
+    )
+    dumper = dumper_module.PubMedMetadataDumper()
+    dumper.client = FakeClient(responses)
+
+    dumper.create_todump_list()
+
+    assert dumper.release == "2026nov08"
+    assert dumper.to_dump[-1]["remote"] == base + name
+    assert Path(dumper.to_dump[-1]["local"]).name == name
+    write_local_release(Path(dumper.new_data_folder), name)
+    dumper.post_dump()
+    assert dumper.base_post_dump_called
+    requested_urls = [url for url, _ in dumper.client.calls]
+    assert f"{ROOT_URL}2026aug5/" not in requested_urls
+
+
+@pytest.mark.parametrize("location", ["release", "nested", "both"])
+@pytest.mark.parametrize("second_name", [
+    "validation_report-20260927.json",
+    "validation_report-20260926.json.gz",
+    "validation_report.json",
+])
+def test_ambiguous_release_local_reports_stop_discovery(
+    dumper_module, location, second_name
+):
+    responses = nested_manifest_responses()
+    base = f"{ROOT_URL}2026sep26/"
+    name = "validation_report-20260926.json"
+    shards = [f"pubmed_metadata_{i}.ndjson.gz" for i in range(2)]
+    if location == "release":
+        responses[base] = FakeResponse(text=index_html(*shards, name, second_name))
+    elif location == "nested":
+        responses[base + "manifests/"] = FakeResponse(text=index_html(name, second_name))
+    else:
+        responses[base] = FakeResponse(text=index_html(*shards, second_name, "manifests/"))
+    dumper = dumper_module.PubMedMetadataDumper()
+    dumper.client = FakeClient(responses)
+
+    with pytest.raises(dumper_module.DumperException, match="ambiguous"):
+        dumper.create_todump_list()
+
+    assert dumper.to_dump == []
+    assert f"{ROOT_URL}2026aug21/" not in [url for url, _ in dumper.client.calls]
 
 
 def test_completed_invalid_new_layout_release_never_falls_back(dumper_module):
@@ -564,6 +630,7 @@ def test_post_dump_revalidates_new_layout_report(dumper_module):
         "validation_report.json.gz",
         "validation_report-20260821.json",
         "validation_report-20260821.json.gz",
+        "validation_report-20260822.json",
     ],
 )
 def test_post_only_uses_current_folder_without_discovery(

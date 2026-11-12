@@ -120,6 +120,39 @@ def test_report_lookup_supports_plain_and_compressed_reports(name):
     )
 
 
+@pytest.mark.parametrize("suffix", [".json", ".json.gz"])
+def test_release_local_report_can_be_dated_the_next_day(suffix):
+    name = "validation_report-20261109" + suffix
+    filenames = ["metadata.json", "../", "pmids-20261109.txt.gz", name]
+
+    assert release.find_validation_report_filename(
+        filenames, "2026nov08", release_local=True
+    ) == name
+    assert release.find_validation_report_filename(filenames, "2026nov08") is None
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ["validation_report-20261108.json", "validation_report-20261109.json"],
+        ["validation_report-20261109.json", "validation_report-20261109.json.gz"],
+        ["validation_report.json", "validation_report-20261109.json"],
+        ["validation_report.json", "validation_report.json.gz"],
+    ],
+)
+def test_release_local_report_lookup_rejects_multiple_candidates(names):
+    with pytest.raises(release.PubMedReleaseError, match="ambiguous"):
+        release.find_validation_report_filename(names, "2026nov08", release_local=True)
+
+
+def test_shared_manifest_ignores_other_releases_and_rejects_ambiguous_matches():
+    name = "validation_report-20261108.json"
+    names = [name, "validation_report-20260926.json", "metadata.json"]
+    assert release.find_validation_report_filename(names, "2026nov08") == name
+    with pytest.raises(release.PubMedReleaseError, match="ambiguous"):
+        release.find_validation_report_filename(names + [name + ".gz"], "2026nov08")
+
+
 def test_shard_validation_accepts_a_contiguous_dynamic_inventory():
     filenames = [
         "validation_report.json.gz",

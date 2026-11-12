@@ -85,9 +85,9 @@ def uploader_module(monkeypatch):
     return module
 
 
-def test_jobs_uses_legacy_gzip_report_before_dated_report(tmp_path, uploader_module):
+def test_jobs_rejects_ambiguous_legacy_and_dated_reports(tmp_path, uploader_module):
     data_folder = tmp_path / "2026aug5"
-    shard_paths = write_release(data_folder, padded=True)
+    write_release(data_folder, padded=True)
     legacy_report = json.dumps(validation_report(padded=True)).encode("utf-8")
     (data_folder / "validation_report.json.gz").write_bytes(
         gzip.compress(legacy_report)
@@ -97,7 +97,8 @@ def test_jobs_uses_legacy_gzip_report_before_dated_report(tmp_path, uploader_mod
     uploader = uploader_module.PubMedMetadataUploader()
     uploader.data_folder = str(data_folder)
 
-    assert uploader.jobs() == [(str(path),) for path in shard_paths]
+    with pytest.raises(FileNotFoundError, match="ambiguous"):
+        uploader.jobs()
 
 
 def test_jobs_uses_dated_plain_json_report_for_new_layout(tmp_path, uploader_module):
@@ -126,9 +127,9 @@ def test_jobs_uses_dated_gzip_report_for_new_layout(tmp_path, uploader_module):
 
 @pytest.mark.parametrize(
     "report_filename",
-    (None, "validation_report-20260820.json"),
+    (None, "metadata.json"),
 )
-def test_jobs_rejects_missing_or_wrong_date_dated_report(
+def test_jobs_rejects_missing_or_unrecognized_report(
     tmp_path, uploader_module, report_filename
 ):
     data_folder = tmp_path / "2026aug21"
@@ -142,6 +143,20 @@ def test_jobs_rejects_missing_or_wrong_date_dated_report(
 
     with pytest.raises(FileNotFoundError, match="complete validated release"):
         uploader.jobs()
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_jobs_accepts_next_day_report(tmp_path, uploader_module, compressed):
+    data_folder = tmp_path / "2026nov08"
+    shard_paths = write_release(data_folder, padded=False)
+    payload = json.dumps(validation_report(padded=False)).encode("utf-8")
+    name = "validation_report-20261109.json" + (".gz" if compressed else "")
+    (data_folder / name).write_bytes(gzip.compress(payload) if compressed else payload)
+    (data_folder / "metadata.json").write_text("{}", encoding="utf-8")
+    uploader = uploader_module.PubMedMetadataUploader()
+    uploader.data_folder = str(data_folder)
+
+    assert uploader.jobs() == [(str(path),) for path in shard_paths]
 
 
 def test_jobs_rejects_new_layout_in_an_invalid_release_folder(
