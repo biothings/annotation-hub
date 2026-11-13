@@ -53,6 +53,9 @@ PUBMED_METADATA_MAPPING = {
             "vol": {"type": "keyword"},
             "iss": {"type": "keyword"},
             "pubdate_raw": _source_only_keyword(),
+            "pub_year": _source_only_keyword(),
+            "pub_month": _source_only_keyword(),
+            "pub_day": _source_only_keyword(),
             "pub_date": {
                 "type": "date",
                 "format": PUBMED_DATE_FORMAT,

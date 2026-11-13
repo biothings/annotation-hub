@@ -82,8 +82,8 @@ def _build_exact_pub_date(record: dict) -> str | None:
     """Return an exact ISO date, or ``None`` when any part is not exact.
 
     Date derivation is intentionally non-fatal: unusual or malformed-looking
-    input components simply do not create a query date. Their fidelity value is
-    the source-only ``pubdate_raw`` when the upstream schema provides it.
+    input components simply do not create a query date. Their original strings
+    remain in the source alongside ``pubdate_raw`` when upstream provides it.
     """
 
     year_value = record["pub_year"]
@@ -288,6 +288,9 @@ def transform_pubmed_metadata_record(
         "vol": record["volume"],
         "iss": record["issue"],
         "abstract": record["abstract"],
+        "pub_year": record["pub_year"],
+        "pub_month": record["pub_month"],
+        "pub_day": record["pub_day"],
     }
     if PUBLICATION_TYPES_FIELD in record:
         pubmed[PUBLICATION_TYPES_FIELD] = _validated_publication_types(

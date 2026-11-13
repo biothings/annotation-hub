@@ -79,6 +79,9 @@ def test_transform_namespaces_pubmed_metadata():
             "vol": "12",
             "iss": "3",
             "abstract": "An abstract with Unicode: β.",
+            "pub_year": "2026",
+            "pub_month": "6",
+            "pub_day": "30",
             "pub_date": "2026-06-30",
         },
     }
@@ -236,7 +239,7 @@ def test_accepts_verbatim_pubdate_field_during_upstream_transition(field):
 
     assert document["pubmed"]["pubdate_raw"] == "1998 Dec-1999 Jan"
     for component in ("pub_year", "pub_month", "pub_day"):
-        assert component not in document["pubmed"]
+        assert document["pubmed"][component] == record[component]
     assert "pub_date" not in document["pubmed"]
 
 
@@ -365,12 +368,59 @@ def test_builds_exact_dates(date_parts, expected_date):
         {"pub_year": "2026", "pub_month": "Feb", "pub_day": "30"},
     ],
 )
-def test_discards_input_components_when_no_exact_date_can_be_derived(date_parts):
+def test_preserves_input_components_without_inventing_an_exact_date(date_parts):
     document = parser.transform_pubmed_metadata_record(upstream_record(**date_parts))
 
     for component in ("pub_year", "pub_month", "pub_day"):
-        assert component not in document["pubmed"]
+        assert document["pubmed"][component] == date_parts[component]
     assert "pub_date" not in document["pubmed"]
+    assert "pubdate_raw" not in document["pubmed"]
+
+
+@pytest.mark.parametrize(
+    ("year", "month"),
+    [
+        ("2020", ""),
+        ("2020", "May"),
+        ("2020", "5"),
+        ("2020", "Spring"),
+        ("1994", "Sep-Dec"),
+        ("1998", "Dec-1999 Jan"),
+    ],
+)
+def test_legacy_partial_dates_survive_gzip_ingestion(tmp_path, year, month):
+    record = legacy_record(pub_year=year, pub_month=month, pub_day="")
+    shard_path = tmp_path / "pubmed_metadata_0.ndjson.gz"
+    write_shard(shard_path, [json.dumps(record) + "\n"])
+
+    [document] = parser.iter_pubmed_metadata_documents(shard_path)
+
+    metadata = document["pubmed"]
+    assert (metadata["pub_year"], metadata["pub_month"], metadata["pub_day"]) == (
+        year,
+        month,
+        "",
+    )
+    assert "pubdate_raw" not in metadata
+    assert "pub_date" not in metadata
+
+
+@pytest.mark.parametrize("raw_date", ["", "n.d."])
+def test_preserves_partial_components_when_verbatim_date_is_unusable(raw_date):
+    document = parser.transform_pubmed_metadata_record(
+        upstream_record(
+            pub_year="2020", pub_month="May", pub_day="", pubdate=raw_date
+        )
+    )
+
+    metadata = document["pubmed"]
+    assert (metadata["pub_year"], metadata["pub_month"], metadata["pub_day"]) == (
+        "2020",
+        "May",
+        "",
+    )
+    assert metadata["pubdate_raw"] == raw_date
+    assert "pub_date" not in metadata
 
 
 def test_rejects_verbatim_pubdate_without_identifiers():

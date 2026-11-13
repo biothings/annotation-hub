@@ -53,8 +53,17 @@ def test_verbatim_pubdate_is_source_only():
         "index": False,
         "doc_values": False,
     }
+
+
+def test_publication_date_components_are_retrievable_without_date_coercion():
+    properties = mapping_module.get_pubmed_metadata_mapping()["pubmed"]["properties"]
+
     for field in ("pub_year", "pub_month", "pub_day"):
-        assert field not in properties
+        assert properties[field] == {
+            "type": "keyword",
+            "index": False,
+            "doc_values": False,
+        }
 
 
 def test_publication_date_accepts_exact_days_only():

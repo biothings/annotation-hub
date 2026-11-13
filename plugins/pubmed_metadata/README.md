@@ -28,6 +28,9 @@ PubMed index:
     "title": "Example title",
     "vol": "1",
     "iss": "2",
+    "pub_year": "2026",
+    "pub_month": "6",
+    "pub_day": "30",
     "pubdate_raw": "2026 Jun 30",
     "pub_date": "2026-06-30",
     "abstract": "Example abstract"
@@ -60,14 +63,16 @@ publication types. A structurally malformed record fails the upload with the
 shard and line number rather than producing a partial or silently altered
 document. The default storage also treats duplicate IDs as an error.
 
-Publication dates deliberately have two representations. `pubdate_raw` retains
+Publication date text is retained without coercion. `pubdate_raw` retains
 PubMed's display value verbatim, including seasons and ranges such as `1998
-Dec-1999 Jan`. It remains in Elasticsearch `_source` but has neither an
-inverted index nor doc values. The upstream `pub_year`, `pub_month`, and
-`pub_day` components are used transiently during ingestion and are not stored.
-Older snapshots that do not contain the verbatim field leave `pubdate_raw`
-absent rather than synthesizing a value that could conceal a previously
-truncated `MedlineDate`.
+Dec-1999 Jan`. The upstream `pub_year`, `pub_month`, and `pub_day` strings are
+also stored exactly as supplied, including empty strings and numeric months.
+All four fields remain in Elasticsearch `_source` but have neither an inverted
+index nor doc values. Keeping the separate components preserves known years,
+months, seasons, and ranges even when the verbatim field is absent, empty, or
+unusable. Older snapshots that do not contain the verbatim field leave
+`pubdate_raw` absent rather than synthesizing a value that could conceal a
+previously truncated `MedlineDate`.
 
 `pub_date` is a separate query field. The parser emits it only when all three
 components form a valid calendar day, normalized as `YYYY-MM-DD`, and
@@ -77,9 +82,15 @@ a `pub_date`; this avoids turning incomplete dates into artificial points in
 time. A DocumentMetadataAPI adapter can reconstruct exact year/month/day values
 from `pub_date`; when it is absent, it can apply the upstream leading-year and
 remainder convention to `pubdate_raw` for partial, seasonal, and ranged dates.
-`pubdate_raw` remains the fidelity value. Excluding `pub_date` from API
-responses is the adapter's responsibility rather than an Elasticsearch mapping
-concern.
+When neither representation supplies a usable date, the adapter must fall back
+to the preserved `pub_year`, `pub_month`, and `pub_day` strings, converting an
+ordinary numeric month to its English abbreviation and leaving unknown parts
+empty. For example, `2020` / `May` / an empty day remains available even without
+`pubdate_raw` or `pub_date`. Excluding `pub_date` from API responses is the
+adapter's responsibility rather than an Elasticsearch mapping concern.
+
+Preserving the component fields takes effect on the next upload and index
+build; it does not backfill existing source collections or published indexes.
 
 Before queueing a large download, the dumper requires a published completion
 report. It recognizes `validation_report.json` and dated
