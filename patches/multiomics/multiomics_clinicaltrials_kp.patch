@@ -6,8 +6,8 @@
          "data_url": [
 -            "https://db.systemsbiology.net/gestalt/KG/clinical_trials_kg_edges_current.jsonl.gz",
 -            "https://db.systemsbiology.net/gestalt/KG/clinical_trials_kg_nodes_current.jsonl.gz"
-+            "https://db.systemsbiology.net/gestalt/KG/clinical_trials_kg_edges_v4.2.4.jsonl.gz",
-+            "https://db.systemsbiology.net/gestalt/KG/clinical_trials_kg_nodes_v4.2.4.jsonl.gz"
++            "https://db.systemsbiology.net/gestalt/KG/clinical_trials_kg_edges_v4.2.7.jsonl.gz",
++            "https://db.systemsbiology.net/gestalt/KG/clinical_trials_kg_nodes_v4.2.7.jsonl.gz"
          ],
          "uncompress": false,
          "release": "version:get_release"
@@ -37,7 +37,7 @@
  def open_jsonl(data_folder, which):
      # the dumper may or may not keep the files compressed
 -    path = os.path.join(data_folder, f"clinical_trials_kg_{which}_current.jsonl")
-+    path = os.path.join(data_folder, f"clinical_trials_kg_{which}_v4.2.4.jsonl")
++    path = os.path.join(data_folder, f"clinical_trials_kg_{which}_v4.2.7.jsonl")
      if os.path.exists(path + ".gz"): return gzip.open(path + ".gz", 'rt')
      return open(path)
  

@@ -9,10 +9,13 @@ JSONL annotators. The annotation hub uses only the annotator collections, so the
 local manifests register only `multiomics_clinical_trials_annotator` and
 `multiomics_drug_approvals_annotator`. The TSV parsers remain untouched.
 
-Both local manifests download versioned JSONL files (`v4.2.4` and `v0.5.7`)
+Both local manifests download versioned JSONL files (`v4.2.7` and `v0.5.7`)
 instead of floating `_current` aliases. The annotator input filenames match these
-URLs, and release functions retain the matching upstream version labels. This
-prevents a new upstream release from silently entering the old release folder;
+URLs. Upstream's `version.py` reads each data release from its adjacent
+`version.txt` (`4.2.7` for Clinical Trials and `0.5.7` for Drug Approvals),
+independently of the plugin manifest version (`0.2` for both). The local patches
+leave this upstream version handling unchanged. Pinning the downloads prevents
+a new upstream release from silently entering the old release folder;
 versioned URLs are still controlled by the data provider, not content-addressed.
 
 The Drug Approvals patch propagates input and parse errors instead of silently
@@ -29,6 +32,12 @@ git submodule update --init
 python3 bin/prepare_multiomics.py
 python3 bin/prepare_multiomics.py --check
 ```
+
+When upgrading an existing checkout, first review and remove the previous
+Hub-managed changes to `manifest.json` and `annotator_parser.py` in each plugin,
+preserving any custom edits, then update the submodules and run preparation.
+Preparation deliberately rejects patches left over from a different pin rather
+than overwriting them.
 
 The hub entry point also runs preparation before it loads data plugins.
 Uninitialized plugins are skipped at hub startup so deployments that do not use

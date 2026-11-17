@@ -1,7 +1,7 @@
 [
   {
     "path": "plugins/multiomics_clinicaltrials_kp",
-    "commit": "2d5da6b5f118842eb94fc4146a0b2443924ae31f",
+    "commit": "e34ecbac69ee549fa9d4309862b206df1eae3389",
     "patch": "multiomics_clinicaltrials_kp.patch",
     "files": [
       "manifest.json",
@@ -10,7 +10,7 @@
   },
   {
     "path": "plugins/multiomics_drug_approvals_kp",
-    "commit": "61f74e873454687a04fe1c9a060f8fb5a32923fc",
+    "commit": "9b00c48dbb484675bea9c13ac72bf4d7a6071fa8",
     "patch": "multiomics_drug_approvals_kp.patch",
     "files": [
       "manifest.json",
