@@ -14,6 +14,8 @@ PYTHONPATH=. python3 ./bin/hub.py
 
 Initialize the Multiomics submodules with `git submodule update --init`. Hub
 startup applies annotation-hub's local integration patches before loading them.
+The pinned plugins read data releases from upstream `version.txt` files,
+independently of their manifest versions.
 See [the patch instructions](patches/multiomics/README.md) for manual preparation,
 versioned downloads, and local-edit safeguards.
 

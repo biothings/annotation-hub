@@ -191,11 +191,16 @@ def test_symlinked_plugin_is_not_patched(checkout, tmp_path):
 
 
 @pytest.mark.parametrize("index", [0, 1])
-def test_only_annotation_uploaders_and_versioned_inputs_are_registered(prepared, index):
+def test_only_annotation_uploaders_and_versioned_inputs_are_registered(
+    prepared, index, tmp_path, monkeypatch
+):
     plugin = prepared / ENTRIES[index]["path"]
     manifest = json.loads((plugin / "manifest.json").read_text())
+    monkeypatch.chdir(tmp_path)
     version = _module(plugin / "version.py").get_release(None)
-    assert version == manifest["version"]
+    assert manifest["version"] == "0.2"
+    assert version == (plugin / "version.txt").read_text().strip()
+    assert version != manifest["version"]
     assert [uploader["parser"] for uploader in manifest["uploaders"]] == [
         "annotator_parser:load_data"
     ]
@@ -214,7 +219,7 @@ def test_clinical_trials_reads_pinned_jsonl_and_combines_boxed_warnings(
     _write_rows(
         folder,
         "clinical_trials",
-        "4.2.4",
+        "4.2.7",
         "nodes",
         [
             {"id": "MONDO:1", "name": "condition"},
@@ -232,7 +237,7 @@ def test_clinical_trials_reads_pinned_jsonl_and_combines_boxed_warnings(
     _write_rows(
         folder,
         "clinical_trials",
-        "4.2.4",
+        "4.2.7",
         "edges",
         [
             _edge(
