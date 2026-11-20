@@ -40,6 +40,16 @@ The corresponding web api can be found [here](https://github.com/biothings/bioth
 
 plugins
 * `~/plugins/atc`
+* `~/plugins/hpo` (standalone HPO index)
 * `~/plugins/multiomics_clinicaltrials_kp`
 * `~/plugins/multiomics_drug_approvals_kp`
+* `~/plugins/ncit` (standalone NCI Thesaurus index)
 * `~/plugins/pubmed_metadata` (standalone PubMed index)
+
+HPO and NCIT are local manifest plugins imported from `biothings/pending.api`.
+With `DATA_PLUGIN_FOLDER` pointing to this repository's `plugins` directory, the
+Hub discovers them at startup. They can also be registered in the Hub console
+with `register_url("local://hpo")` and `register_url("local://ncit")`. Both retain
+their weekly download schedules and source names. Build each source separately
+and publish it under the existing `hpo` or `ncit` alias; they are not part of the
+combined annotations build. See their plugin READMEs for provenance and details.
