@@ -13,6 +13,10 @@ This remains a manifest-based plugin with `networkx` and `obonet` declared in
 uses the archived inputs without fetching another ontology version. The existing
 HPO document fields and the weekly download schedule are preserved.
 
+The release helper reads the ontology's `data-version` header with a bounded
+HTTP request. It reports the ontology release (for example, `2026-09-01`) instead
+of the HTTP response date. Hub build dates remain independent of source releases.
+
 With `DATA_PLUGIN_FOLDER` configured to this repository's `plugins` directory,
 Hub discovers the manifest and registers the source as `local://hpo`.
 
