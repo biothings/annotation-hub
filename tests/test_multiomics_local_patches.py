@@ -418,6 +418,17 @@ def test_hub_startup_continues_and_registers_only_prepared_sources(
         for i, entry in enumerate(ENTRIES)
     ]
 
+    migrations = []
+
+    def migrate_upload_metadata(source_manager, logger):
+        # Migration needs the final registrations, including manifest uploaders.
+        assert source_manager.upload_manager.register == unrelated + multiomics
+        migrations.append(source_manager)
+
+    monkeypatch.setattr(
+        PREPARE, "migrate_multiomics_upload_metadata", migrate_upload_metadata
+    )
+
     class Manager:
         def __init__(self):
             self.register = []
@@ -436,6 +447,9 @@ def test_hub_startup_continues_and_registers_only_prepared_sources(
         def configure_source_manager(self):
             for manager in self.managers.values():
                 manager.register_classes(unrelated + multiomics)
+            self.managers["source_manager"] = types.SimpleNamespace(
+                upload_manager=self.managers["upload_manager"]
+            )
 
         def start(self):
             self.configure_source_manager()
@@ -450,8 +464,12 @@ def test_hub_startup_continues_and_registers_only_prepared_sources(
         namespace = runpy.run_path(str(ROOT / "bin" / "hub.py"), run_name="__main__")
     server = namespace["server"]
     assert server.started
+    assert migrations == (
+        [server.managers["source_manager"]] if scenario == "ready" else []
+    )
     expected = unrelated + multiomics if scenario == "ready" else unrelated
-    for manager in server.managers.values():
+    for key in ("dump_manager", "upload_manager", "dataplugin_manager"):
+        manager = server.managers[key]
         assert manager.register == expected
         # The same protection applies to a later reload or manual registration.
         manager.register_classes(multiomics)
