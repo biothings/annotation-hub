@@ -475,11 +475,9 @@ class NameResDumper(LastModifiedHTTPDumper):
             Path(f"{chunk_path}.tmp").unlink(missing_ok=True)
 
     def set_release(self) -> None:
-        """
-        Parses the BASE_URL to extract the data from the url pathing
-        """
+        """Extract the release directory from BASE_URL, allowing a trailing slash."""
         parse_result = urlparse(BASE_URL)
-        self.release = parse_result.path.split("/")[-1]
+        self.release = parse_result.path.rstrip("/").split("/")[-1]
 
     def post_dump(self, *args, **kwargs):
         """
