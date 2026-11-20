@@ -142,6 +142,25 @@ def make_dumper(dumper_module):
 
 
 @pytest.mark.parametrize(
+    "range_dumper_module", [("nameres", "NameResDumper")], indirect=True
+)
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://stars.renci.org/var/babel_outputs/2025sep1/",
+        "https://stars.renci.org/var/babel_outputs/2025sep1",
+    ],
+)
+def test_nameres_release_from_base_url(range_dumper_module, monkeypatch, base_url):
+    monkeypatch.setattr(range_dumper_module, "BASE_URL", base_url)
+    dumper = make_dumper(range_dumper_module)
+
+    dumper.set_release()
+
+    assert dumper.release == "2025sep1"
+
+
+@pytest.mark.parametrize(
     ("file_size", "partitions", "expected"),
     [
         (10, 3, [(0, 3), (4, 7), (8, 9)]),
