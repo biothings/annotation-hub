@@ -29,6 +29,35 @@ _MULTIOMICS_IDENTIFIERS = frozenset(
 )
 
 
+def migrate_multiomics_upload_metadata(source_manager, logger) -> list[str]:
+    """Remove retired upload-job records after annotator-only registration.
+
+    Removing an uploader from a manifest leaves its persisted upload job behind.
+    The build metadata code still compares that job's release with the active
+    annotator's release, so existing hubs need this cleanup even when their
+    plugin files have already been patched. Source collections are preserved.
+    """
+    retired = []
+    for main_source, legacy in (
+        ("multiomics_clinicaltrials_kp", "multiomics_clinical_trials"),
+        ("multiomics_drug_approvals_kp", "multiomics_drug_approvals"),
+    ):
+        registered = {
+            uploader.name
+            for uploader in source_manager.upload_manager.register.get(main_source, [])
+        }
+        if f"{legacy}_annotator" not in registered or legacy in registered:
+            continue
+        doc = source_manager.src_dump.find_one({"_id": main_source}) or {}
+        if legacy not in doc.get("upload", {}).get("jobs", {}):
+            continue
+        source_manager.reset(main_source, key="upload", subkey=legacy)
+        fullname = f"{main_source}.{legacy}"
+        retired.append(fullname)
+        logger.info("Removed retired Multiomics upload status: %s", fullname)
+    return retired
+
+
 def block_unprepared_multiomics(manager, logger) -> None:
     """Reject Multiomics registration for this manager, including later reloads."""
     if getattr(manager, "_multiomics_registration_blocked", False):

@@ -51,6 +51,26 @@ upstream files, files already patched by this tool, and the known annotation-onl
 manifest override used on su06. Other local edits stop preparation and are left
 untouched. Existing data folders and running services are not modified.
 
+After loading prepared plugins at startup, the hub also migrates existing upload
+metadata. When an annotator uploader is registered and its obsolete TSV uploader
+is absent, it removes only the TSV uploader's saved `src_dump.upload.jobs` entry
+(`multiomics_clinical_trials` or `multiomics_drug_approvals`). Otherwise BioThings
+still compares that retired job's old release with the annotator's current
+release and fails the build's metadata step. This cleanup is idempotent and runs
+even if the plugin files were already patched. It preserves the data collections,
+annotator upload records, download history, inspection records, and mappings.
+The standalone preparation command changes plugin files only.
+
+For a running hub that has already hit this error, deploying this update and
+restarting applies the metadata migration. To apply the same cleanup immediately,
+run these commands in the hub console, then retry the annotations build:
+
+```python
+source_reset("multiomics_clinicaltrials_kp", key="upload", subkey="multiomics_clinical_trials")
+source_reset("multiomics_drug_approvals_kp", key="upload", subkey="multiomics_drug_approvals")
+merge(build_name="annotations")
+```
+
 If preparation fails at hub startup, an error with `notify` reports the cause.
 The hub continues starting its other sources while blocking Multiomics dumper,
 uploader, and data-plugin registration for that process, including later reloads

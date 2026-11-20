@@ -9,7 +9,12 @@ app_folder, _src = os.path.split(os.path.split(os.path.abspath(__file__))[0])
 set_versions(config, app_folder)
 logging = config.logger
 
-from prepare_multiomics import PatchError, block_unprepared_multiomics, prepare_multiomics
+from prepare_multiomics import (
+    PatchError,
+    block_unprepared_multiomics,
+    migrate_multiomics_upload_metadata,
+    prepare_multiomics,
+)
 
 multiomics_ready = True
 try:
@@ -39,7 +44,11 @@ class AnnotationHubServer(HubServer):
                 manager = self.managers.get(name)
                 if manager is not None:
                     block_unprepared_multiomics(manager, logging)
-        return super().configure_source_manager()
+        result = super().configure_source_manager()
+        source_manager = self.managers.get("source_manager")
+        if multiomics_ready and source_manager is not None:
+            migrate_multiomics_upload_metadata(source_manager, logging)
+        return result
 
 
 if __name__ == "__main__":
